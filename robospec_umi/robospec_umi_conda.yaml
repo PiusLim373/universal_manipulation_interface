@@ -1,0 +1,110 @@
+# Clone of the working `umi2` environment: UMI on an RTX 5070 (Blackwell, sm_120).
+#
+# Verified on this env: ChArUco -> zarr -> UmiDataset -> GPU training step, with
+# torch reporting kernels ['sm_75'...'sm_100','sm_120','compute_120'] and a real
+# CUDA matmul running. Peak VRAM at dataloader batch_size=8 is 6401 MiB of 8151.
+#
+#   conda env create -f conda_environment_umi2.yaml
+#   conda activate umi2
+#   python -c "import torch; print(torch.__version__, \
+#       'sm_120' in torch.cuda.get_arch_list())"   # must print True
+#
+# Differences from conda_environment.yaml, all forced rather than preferred:
+#
+#  1. torch/torchvision moved from conda to pip. There is NO conda build that works
+#     here: `pytorch-cuda` stops at 12.4, and conda-forge's py39 pytorch 2.7.0 is a
+#     cuda126 build -- it installs cleanly and then dies at runtime with "no kernel
+#     image is available for execution on the device", which is the worst failure
+#     mode because it looks like success. sm_120 needs CUDA >= 12.8.
+#
+#  2. torch is pinned to exactly 2.7.0. It is the LAST release with a cp39 cu128
+#     wheel: 2.7.1 and everything after are cp310+. python=3.9 therefore pins the
+#     torch version, not the other way round. Moving to a newer torch means moving
+#     the whole env to python>=3.10.
+#
+#  3. protobuf and huggingface_hub are pinned DOWN, against newer versions that pip
+#     pulls in transitively. Both break the training workspace at *import* time,
+#     before any config or data is read -- see the notes in the pip section.
+#
+# The `pytorch` conda channel is gone from the channel list since nothing is taken
+# from it any more.
+
+name: umi2
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip=22.1
+  - numpy=1.24
+  - scipy=1.11
+  - numba=0.57
+  - pandas=2.1
+  - py-opencv=4.7
+  - ipykernel=6.23
+  - matplotlib=3.7
+  - av=10.0
+  - k3d=2.15
+  - pyyaml=6.0
+  - tqdm=4.65
+  - zarr=2.16
+  - numcodecs=0.11
+  - hydra-core=1.2.0
+  - wandb=0.15.8
+  - dill=0.3.7
+  - einops=0.6.1
+  - diffusers=0.18.2
+  - scikit-video=1.1
+  - gym=0.21.0
+  # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
+  - llvm-openmp=14
+  - python-lmdb=1.4
+  - timm=0.9.7
+  - scikit-fda=0.9
+  - cython=0.29
+  - accelerate=0.24
+  - boto3=1.33
+  - exiftool=12
+  - aiohttp=3.9
+  - aiofiles=23.2
+  - pip:
+    # --extra-index-url ADDS the pytorch index to PyPI rather than replacing it, so
+    # everything below still resolves normally. The explicit +cu128 local version is
+    # what forces the CUDA 12.8 build instead of the plain PyPI wheel.
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.7.0+cu128
+    - torchvision==0.22.0+cu128
+    # torchaudio is installed in the source env but imported nowhere in this repo,
+    # so it is left out. Add it back if something you add later needs it.
+
+    # wandb 0.15.8 requires protobuf<5. With protobuf 6 the workspace import dies:
+    #   AttributeError: module 'wandb.proto.wandb_internal_pb2' has no attribute 'Result'
+    # tensorboard asks for >=6.31 and pip will warn about it -- ignore that, nothing
+    # in this repo imports tensorboard.
+    - protobuf==4.25.8
+    # diffusers 0.18.2 calls cached_download(), which huggingface_hub removed in 0.26:
+    #   ImportError: cannot import name 'cached_download' from 'huggingface_hub'
+    - huggingface_hub==0.25.2
+
+    - ray[default]==2.8.0
+    - threadpoolctl==3.2
+    - v4l2py==2.2
+    # The WRIST camera. It was installed by hand into the source env and never
+    # made it into this file, so the env built from here could not record a wrist
+    # stream at all -- capture.py guards the import and sets rs = None, which
+    # means no ImportError, just a session with the wrist camera silently absent.
+    # Caught by building the container, where nothing had been installed by hand.
+    - pyrealsense2==2.56.5.9235
+    - ur-rtde==1.5.6
+    # requires apt install libspnav-dev spacenavd; systemctl start spacenavd
+    - spnav @ https://github.com/cheng-chi/spnav/archive/c1c938ebe3cc542db4685e0d13850ff1abfdb943.tar.gz
+    - atomics==1.0.2
+    - pynput==1.7.6
+    - fastcrc==0.2
+    - imagecodecs==2023.9.18
+    - robomimic==0.2.0
+    # requires mujoco py dependencies libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
+    - free-mujoco-py==2.1.6
+    - robosuite @ https://github.com/cheng-chi/robosuite/archive/3f2c3116f1c0a1916e94bfa28da4d055927d1ab3.tar.gz
+    # implicitly depend on conda package exiftool
+    - PyExifTool==0.5

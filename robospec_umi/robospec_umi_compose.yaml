@@ -1,0 +1,69 @@
+# robospec_umi container.
+#
+#   export ROBOSPEC_UMI_DIRECTORY=/path/to/universal_manipulation_interface
+#   xhost +local:docker                       # only if you want cv2.imshow
+#   docker compose -f robospec_umi/robospec_umi_compose.yaml build
+#   docker compose -f robospec_umi/robospec_umi_compose.yaml up -d
+#   docker compose -f robospec_umi/robospec_umi_compose.yaml exec robospec bash
+#
+# The UI is at http://localhost:8080 (a placeholder until robospec_umi_ui/ has a
+# dist/).
+
+services:
+  robospec:
+    # :? fails with a readable message when the variable is unset, rather than
+    # silently building from the current directory or binding an empty path.
+    build:
+      context: ${ROBOSPEC_UMI_DIRECTORY:?set ROBOSPEC_UMI_DIRECTORY to the repo root}
+      dockerfile: robospec_umi/robospec_umi.Dockerfile
+      args:
+        # NOT ${UID}: bash marks UID readonly, so `export UID=$(id -u)` errors,
+        # and an unexported shell variable never reaches compose anyway. Defaults
+        # suit a first human account; override only if `id -u` is not 1000.
+        UID: "${ROBOSPEC_UID:-1000}"
+        GID: "${ROBOSPEC_GID:-1000}"
+    image: robospec-umi:latest
+    container_name: robospec_umi
+
+    # The cameras need real device access: V4L2 ioctls for the scene camera, and
+    # USB resets plus firmware queries for the RealSense. This does mean the
+    # container is not a security boundary.
+    privileged: true
+    volumes:
+      - /dev:/dev
+      # cv2.imshow draws on the host's X server through this socket.
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      # The whole repo, so code edits are live and data/ writes land on the host.
+      - ${ROBOSPEC_UMI_DIRECTORY}:/workspace
+      # The UI again, separately, so it can be relocated outside the repo without
+      # touching anything else. Docker resolves the more specific mount, so UI
+      # edits on the host are live in the container -- no rebuild while iterating.
+      - ${ROBOSPEC_UMI_UI_DIRECTORY:-${ROBOSPEC_UMI_DIRECTORY}/robospec_umi/robospec_umi_ui}:/workspace/robospec_umi/robospec_umi_ui
+
+    # Docker's default /dev/shm is 64 MB. A PyTorch DataLoader with workers runs
+    # out and the workers die as "DataLoader worker (pid N) is killed by signal:
+    # Bus error" -- which reads like a bug in the training code rather than a
+    # container setting. Training needs this.
+    shm_size: '8gb'
+
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      NVIDIA_VISIBLE_DEVICES: all
+
+    ports:
+      - "8080:8080"
+
+    # Host GPU. `video` alongside gpu/compute is what makes h264_nvenc work; see
+    # the note in the Dockerfile.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, utility, compute]
+
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

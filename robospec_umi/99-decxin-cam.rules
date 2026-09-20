@@ -1,0 +1,24 @@
+# DECXIN 1080p120 scene camera -> /dev/scene_cam
+#
+# Install:
+#   sudo cp robospec_umi/99-decxin-cam.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   ls -l /dev/scene_cam
+#
+# WHY A NAME AND NOT A NUMBER
+# USB enumeration order is not stable. This camera has been /dev/video4 and
+# /dev/video10 on the same machine depending on what else was plugged in first,
+# and /dev/video4 is currently the RealSense D405 (8086:0b5b). Opening the wrong
+# node does not fail loudly -- it hands you a different camera.
+#
+# WHY ATTR{index}=="0"
+# The DECXIN exposes TWO video4linux nodes. index 0 is the capture node; index 1
+# opens without error and delivers no frames. Without this filter the symlink can
+# land on that second node, which looks like a hang rather than a misconfiguration.
+#
+# WHY MODE 0666
+# So the container's non-root `robospec` user can open the device without its
+# group GID having to match the host's `video` group. librealsense's own shipped
+# rules already do this for the RealSense nodes on this machine.
+
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1bcf", ATTRS{idProduct}=="2d50", ATTR{index}=="0", SYMLINK+="scene_cam", GROUP="video", MODE="0666"
