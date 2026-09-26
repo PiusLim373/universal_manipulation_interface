@@ -23,7 +23,7 @@ The board is planar, so PnP has the usual two-fold depth-flip ambiguity when it 
 seen small and near fronto-parallel. IPPE picks the lower-error branch, and the
 previous frame's pose seeds the refinement to keep the track on one branch.
 
-This file is deliberately standalone -- stdlib, cv2 and numpy only. build_zarr.py
+This file is deliberately standalone -- stdlib, cv2 and numpy only. episode_prep.py
 imports it for the solver and the seed-poisoning guards in track(); it is also
 runnable on its own for one-off analysis of a recorded folder.
 
@@ -33,7 +33,7 @@ sensor_msgs/CameraInfo k/d dict and bare fx/fy/cx/cy json are both accepted, and
 --intrinsics "" falls back to the built-in RealSense table.
 
 Usage:
-    python3 robospec_umi/robospec_umi_capture/video_processor_charuco.py <folder>
+    python3 robospec_umi/robospec_umi_dataset/video_processor_charuco.py <folder>
 """
 
 import argparse
@@ -48,7 +48,7 @@ import numpy as np
 
 CV_VER = tuple(int(v) for v in cv2.__version__.split('.')[:2])
 
-HERE = os.path.dirname(os.path.abspath(__file__))   # .../robospec_umi_capture
+HERE = os.path.dirname(os.path.abspath(__file__))   # .../robospec_umi_dataset
 PKG = os.path.dirname(HERE)                         # .../robospec_umi
 REPO = os.path.dirname(PKG)                         # repo root
 DATA = os.path.join(REPO, 'data')

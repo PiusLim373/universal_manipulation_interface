@@ -5,6 +5,7 @@ import Page from '@/components/Page'
 import CameraStream from '@/components/CameraStream'
 import CameraBusy from '@/components/CameraBusy'
 import PreviewLock from '@/components/PreviewLock'
+import Stepper from '@/components/Stepper'
 import useHotkeys from '@/hooks/useHotkeys'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -17,33 +18,6 @@ const STAGES = [
   { id: 'record', label: 'Capture Dataset', icon: Video },
 ]
 
-function Stepper({ current, reached }) {
-  const at = STAGES.findIndex((s) => s.id === current)
-  return (
-    <div className="flex items-center gap-1">
-      {STAGES.map((s, i) => {
-        const Icon = s.icon
-        const done = i < at
-        const now = i === at
-        return (
-          <div key={s.id} className="flex items-center gap-1">
-            <div className={cn(
-              'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
-              now && 'bg-primary text-primary-foreground font-medium',
-              done && 'text-[#22c55e]',
-              !now && !done && 'text-muted-foreground',
-              !reached(s.id) && 'opacity-40',
-            )}>
-              {done ? <Check className="size-4" /> : <Icon className="size-4" />}
-              {s.label}
-            </div>
-            {i < STAGES.length - 1 && <div className="w-5 h-px bg-border" />}
-          </div>
-        )
-      })}
-    </div>
-  )
-}
 
 /* ----------------------------------------------- the RECORD / IDLE / WAITING
    WAITING is not decoration. Arming blocks for LEAD (0.2 s) and stopping for
@@ -339,7 +313,7 @@ export default function CaptureNew() {
   return (
     <Page title="New capture" back="/" fill wide>
       <div className="pb-4 mb-4 border-b border-border shrink-0">
-        <Stepper current={stage} reached={reached} />
+        <Stepper stages={STAGES} current={stage} reached={reached} />
       </div>
       {bootErr && (
         <p className="text-sm text-destructive shrink-0 mb-3">

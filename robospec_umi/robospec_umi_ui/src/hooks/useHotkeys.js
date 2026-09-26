@@ -16,15 +16,20 @@ const TEXT_TYPES = new Set(['text', 'number', 'search', 'email', 'password',
  * preventDefault() on keydown is what stops a focused <button> also firing --
  * Enter activates a button on keydown and Space on keyup, and cancelling the
  * keydown suppresses both, along with Space scrolling the page.
+ *
+ * Auto-repeat is ignored except for the keys listed in `repeat`.
  */
-export default function useHotkeys(map, enabled = true) {
+export default function useHotkeys(map, enabled = true, repeat = null) {
   const ref = useRef(map)
   ref.current = map
+  const rep = useRef(repeat)
+  rep.current = repeat
 
   useEffect(() => {
     if (!enabled) return undefined
     const onKey = (e) => {
-      if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      if (e.repeat && !rep.current?.includes(e.key)) return
       const t = e.target
       if (t?.isContentEditable) return
       const tag = t?.tagName

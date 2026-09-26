@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Navigate, useNavigate, useParams, Link } from 'react-router-dom'
-import { Eye, Camera, Calculator, Check, X, RotateCcw, Play, Pause, AlertTriangle, Loader2 } from 'lucide-react'
+import { Eye, Camera, Calculator, X, RotateCcw, Play, Pause, AlertTriangle, Loader2 } from 'lucide-react'
 import Page from '@/components/Page'
 import CameraStream from '@/components/CameraStream'
 import CoverageMeters from '@/components/CoverageMeters'
 import CameraBusy from '@/components/CameraBusy'
 import PreviewLock from '@/components/PreviewLock'
+import Stepper from '@/components/Stepper'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
@@ -19,33 +20,6 @@ const STAGES = [
 ]
 const MIN_FRAMES = 8
 
-function Stepper({ current, reached }) {
-  const at = STAGES.findIndex((s) => s.id === current)
-  return (
-    <div className="flex items-center gap-1">
-      {STAGES.map((s, i) => {
-        const Icon = s.icon
-        const done = i < at
-        const now = i === at
-        return (
-          <div key={s.id} className="flex items-center gap-1">
-            <div className={cn(
-              'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
-              now && 'bg-primary text-primary-foreground font-medium',
-              done && 'text-[#22c55e]',
-              !now && !done && 'text-muted-foreground',
-              !reached(s.id) && 'opacity-40',
-            )}>
-              {done ? <Check className="size-4" /> : <Icon className="size-4" />}
-              {s.label}
-            </div>
-            {i < STAGES.length - 1 && <div className="w-5 h-px bg-border" />}
-          </div>
-        )
-      })}
-    </div>
-  )
-}
 
 /* ------------------------------------------------------ stage 2: capture */
 function CaptureStage({ onSolve, onProgress }) {
@@ -357,7 +331,7 @@ export default function CalibrationNew() {
   return (
     <Page title="New calibration" back="/calibration" fill={fill} wide>
       <div className="pb-4 mb-4 border-b border-border shrink-0">
-        <Stepper current={stage} reached={reached} />
+        <Stepper stages={STAGES} current={stage} reached={reached} />
       </div>
       {stage === 'lock' && (
         <PreviewLock endpoints={CALIB_PREVIEW} onDone={() => {

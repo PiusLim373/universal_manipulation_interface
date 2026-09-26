@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { Plus, Trash2, CheckCircle2, Circle, AlertTriangle, ScanEye } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { Plus, Trash2, CheckCircle2, Circle, AlertTriangle, ScanEye, Upload } from 'lucide-react'
 import Page from '@/components/Page'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -21,7 +21,9 @@ function ActiveCard({ active }) {
             <p className="font-medium">No active calibration</p>
             <p className="text-sm text-muted-foreground">
               Capture and verify will not cross-check focus and zoom until one is
-              activated, which means a wrong lens setting would go unnoticed.
+              activated, which means a wrong lens setting would go unnoticed, and
+              datasets cannot be edited or exported. Solve a new calibration, or
+              upload an intrinsic <code>.json</code>.
             </p>
           </div>
         </CardContent>
@@ -78,6 +80,10 @@ export default function Calibration() {
   const [active, setActive] = useState(null)
   const [busy, setBusy] = useState(null)
   const [err, setErr] = useState(null)
+  const [note, setNote] = useState(null)
+  const [fresh, setFresh] = useState(null)
+  const fromEdit = useSearchParams()[0].get('from') === 'edit'
+  const file = useRef(null)
 
   const load = useCallback(async () => {
     try {
@@ -98,27 +104,65 @@ export default function Calibration() {
   }
 
   const remove = async (name) => {
-    if (!confirm(`Delete calibration run ${name}? The captured frames go with it.`)) return
+    const r = runs.find((x) => x.name === name)
+    if (!confirm(`Delete calibration run ${name}? The captured frames go with it.`
+      + (active?.source_run === name ? '\n\nThis is the active intrinsic: deleting it deactivates it.' : '')
+      + (r?.datasets ? `\n\n${r.datasets} dataset(s) use it and will need rebinding.` : ''))) return
     setBusy(name)
     try { await api.deleteRun(name); await load() }
     catch (e) { setErr(e.message) }
     finally { setBusy(null) }
   }
 
+  const upload = async (f) => {
+    if (!f) return
+    setErr(null); setNote(null)
+    try {
+      const r = await api.uploadIntrinsics(f)
+      setFresh(r.run)
+      setNote({ text: `Imported ${r.run}${r.activated ? ' and activated it' : ''}.`, warnings: r.warnings })
+      await load()
+    } catch (e) { setErr(`${f.name}: ${e.message}`) }
+    finally { file.current.value = '' }
+  }
+
   return (
-    <Page title="Calibration" back="/">
+    <Page title="Calibration" back={fromEdit ? '/edit' : '/'}>
       <div className="space-y-6">
+        {fromEdit && (
+          <p className="text-sm text-muted-foreground">
+            Activate the scene intrinsic for your dataset, then go back to Edit dataset.
+          </p>
+        )}
         {err && (
           <div className="rounded-md bg-destructive/10 text-destructive px-3 py-2 text-sm">{err}</div>
+        )}
+        {note && (
+          <div className="rounded-md bg-[#22c55e]/10 px-3 py-2 text-sm">
+            {note.text}
+            {note.warnings.map((w) => (
+              <div key={w} className="text-[#f59e0b] flex items-center gap-1.5">
+                <AlertTriangle className="size-3.5" /> {w}
+              </div>
+            ))}
+          </div>
         )}
 
         <ActiveCard active={active} />
 
         <div className="flex items-center justify-between">
           <h2 className="font-heading font-medium">Calibration runs</h2>
-          <Link to="/calibration/new">
-            <Button size="sm"><Plus className="size-4" /> New calibration</Button>
-          </Link>
+          <div className="flex gap-2">
+            <input ref={file} type="file" accept=".json,application/json" className="hidden"
+                   onChange={(e) => upload(e.target.files[0])} />
+            <Button size="sm" variant="outline" onClick={() => file.current.click()}
+                    title="import a scene_intrinsics.json solved elsewhere">
+              <Upload className="size-4" /> Upload intrinsic .json
+            </Button>
+            <Link to="/calibration/new">
+              <Button size="sm"><Plus className="size-4" /> New calibration</Button>
+            </Link>
+          </div>
         </div>
 
         {runs.length === 0 ? (
@@ -143,14 +187,18 @@ export default function Calibration() {
                   const isActive = active?.source_run === r.name
                   return (
                     <tr key={r.name} className={cn('border-t border-border',
-                                                   isActive && 'bg-primary/5')}>
+                                                   isActive && 'bg-primary/5',
+                                                   fresh === r.name && 'ring-1 ring-inset ring-[#22c55e]/60')}>
                       <td className="px-3 py-2 font-mono text-xs flex items-center gap-1.5">
                         {isActive
                           ? <CheckCircle2 className="size-3.5 text-[#22c55e] shrink-0" />
                           : <Circle className="size-3.5 text-muted-foreground/40 shrink-0" />}
                         {r.name}
                       </td>
-                      <td className="px-3 py-2 tabular-nums">{r.frames}</td>
+                      <td className="px-3 py-2 tabular-nums">
+                        {r.frames === 0 && r.solved
+                          ? <span className="text-muted-foreground">imported</span> : r.frames}
+                      </td>
                       <td className="px-3 py-2 tabular-nums">
                         {r.solved ? `${fmt(r.reproj)} px` :
                           <span className="text-muted-foreground">not solved</span>}

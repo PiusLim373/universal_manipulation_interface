@@ -10,9 +10,11 @@ pose, which means the whole pipeline runs on two USB cameras and a printed board
 ```
 robospec_umi/
 ├── robospec_umi_calibration/   calibrate_scene_cam.py, scene_cam_charuco_detector.py
-├── robospec_umi_capture/       capture.py, verify.py, build_zarr.py, video_processor_charuco.py
+├── robospec_umi_capture/       capture.py
+├── robospec_umi_dataset/       verify.py, episode_prep.py, timeline.py, build_zarr.py,
+│                               video_processor_charuco.py
 ├── robospec_umi_evaluation/    eval_without_robot.py
-├── robospec_umi_ui/            (not yet built)
+├── robospec_umi_ui/            the web UI (React + Vite, built into dist/)
 ├── robospec_umi_server.py      serves the UI; the container's entrypoint
 ├── robospec_umi_conda.yaml
 ├── robospec_umi.Dockerfile
@@ -29,8 +31,10 @@ data/
 │   └── <datetime>/               <- one directory per calibration run
 ├── capture/
 │   └── <datetime>/               <- one directory per recording session
+│       └── epNNN/derived/        <- edit/export cache (tracking, preview videos); safe to delete
 ├── dataset/
-│   └── *.zarr.zip                <- what training and evaluation read
+│   ├── <datetime>_dataset.json   <- the edit project: sessions, verify results, trims, export report
+│   └── <datetime>_dataset.zarr.zip  <- what training and evaluation read
 ├── outputs/
 │   └── <date>/                   <- training runs and checkpoints
 └── evaluation/
@@ -338,53 +342,56 @@ Writes `data/capture/<datetime>/` with one `epNNN/` per episode, each holding
 purpose so recording never waits on the display. A large on-screen `skipped`
 count is correct, not a problem.
 
-### 3b. Verify
+### 3b. Edit and export the dataset
+
+In the web UI, **Edit dataset** is four stages; the project autosaves to
+`data/dataset/<datetime>_dataset.json`, so a refresh or a restart resumes it.
+
+1. **Select Sessions** — pick sessions from `data/capture/`. Episodes are used in
+   place; nothing is copied.
+2. **Verify Sessions** — runs `verify.py` on each. Failed episodes are locked out
+   of the dataset. Auto exposure / white balance are allowed and not reported.
+3. **Edit Sessions** — per episode: the annotated scene video, the wrist video
+   and the TCP track on one timeline. Trim with `[` / `]`, exclude with `X`.
+   The seek bar shows each frame's tracking status and the segments export will
+   actually keep, so a trim can rescue an episode that would otherwise fall below
+   the 90% usable gate.
+4. **Export Training Dataset** — writes `data/dataset/<datetime>_dataset.zarr.zip`.
+
+Preparing an episode (ChArUco detection, pose track, browser-playable videos)
+takes ~30–90 s. It runs in the background, two at a time, the viewed episode
+first, and pauses while a capture is recording. Results are cached in
+`<ep>/derived/` and reused until the active calibration changes.
+
+A dataset is bound to the scene intrinsic that was active when it was created;
+the Edit page shows which one each dataset and each `.zarr.zip` uses. While a
+different intrinsic is active, the dataset is locked: activate its own again (no
+re-render), or rebind it to the active one (episodes re-prep, detections are
+reused; verify reruns). An intrinsic solved elsewhere can be imported from the
+Calibration page with **Upload intrinsic .json**. It lands in
+`data/calibration/<source_run>/`, and is activated only if none is active.
+
+Or from the CLI:
 
 ```bash
-python robospec_umi/robospec_umi_capture/verify.py data/capture/<datetime>
-```
-
-Run this before trusting a session. It catches the failures that leave no visible
-trace: a sidecar one entry longer than its video shifts every subsequent frame by
-~10 ms — about 1 cm of TCP label error, applied silently for the rest of the
-recording, while the video still plays and the poses still look reasonable.
-
-It also re-checks focus and zoom against the calibration. A **match** line is the
-proof the intrinsics apply to this footage; silence means it could not find the
-calibration file.
-
-### 3c. Build the dataset
-
-```bash
-python robospec_umi/robospec_umi_capture/build_zarr.py \
+python robospec_umi/robospec_umi_dataset/verify.py data/capture/<datetime>
+python robospec_umi/robospec_umi_dataset/episode_prep.py data/capture/<datetime>/ep000
+python robospec_umi/robospec_umi_dataset/build_zarr.py \
     data/capture/<datetime> -o data/dataset/dataset.zarr.zip
+python robospec_umi/robospec_umi_dataset/build_zarr.py \
+    --project data/dataset/<datetime>_dataset.json
 ```
 
-Tracks the small 4×4 / 20 mm board through the scene video, solves a TCP pose per
-frame, resamples onto a 60 Hz time grid and pairs each grid point with the
-nearest wrist frame. Accepts several session directories at once.
+`verify.py` catches the failures that leave no visible trace: a sidecar one entry
+longer than its video shifts every later frame by ~10 ms — about 1 cm of TCP
+label error, applied silently. It also re-checks focus and zoom against the
+calibration.
 
-Grid points are chosen **by time, never by frame index** — the wrist camera drops
-~3.4% of frames in bursts up to 167 ms, so striding every Nth frame stops being
-uniform the moment one is dropped.
-
-Read the per-episode summary. Each line reports what was thrown away and why:
-spikes (planar depth-ambiguity flips), pose-track gaps, grid points with no wrist
-frame close enough, and contiguous runs too short to yield a training sample.
-
-To see *where* those losses happen:
-
-```bash
-python robospec_umi/robospec_umi_capture/build_zarr.py \
-    data/capture/<datetime> -o data/dataset/dataset.zarr.zip \
-    --annotate-video --annotate-episode ep003
-```
-
-Writes `<ep>/scene/scene_annotated.mp4` — the tracking overlay plus a colour-coded
-banner per frame saying what the dataset did with it. Off by default; roughly
-30–60 s and 30–60 MB per episode. Scrub the red bands to see whether a run of
-dropped frames is the board sitting near fronto-parallel (a recording-geometry
-problem, fixed by tilting the board or working closer) or something else.
+`build_zarr.py` tracks the small 4×4 / 20 mm board, solves a TCP pose per frame,
+resamples onto a 60 Hz grid and pairs each grid point with the nearest wrist
+frame. Grid points are chosen **by time, never by frame index** — the wrist drops
+frames in bursts, so striding every Nth frame stops being uniform the moment one
+is lost. The per-episode summary says what was thrown away and why.
 
 ---
 

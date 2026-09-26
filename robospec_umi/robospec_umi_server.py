@@ -28,9 +28,11 @@ applying back-pressure to the camera, which is the correct trade for a preview.
 import argparse
 import asyncio
 import glob
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -69,6 +71,8 @@ log = logging.getLogger('robospec')
 log_cam = log.getChild('camera')      # leases, sessions, worker threads
 log_cap = log.getChild('capture')     # recording lifecycle
 log_job = log.getChild('job')         # subprocesses
+log_edit = log.getChild('edit')       # dataset editing + prep queue
+log_cal = log.getChild('calibration')  # activate / import / delete
 
 
 class QuietLibav(logging.Filter):
@@ -110,7 +114,7 @@ class QuietPaths(logging.Filter):
     """
 
     NOISY = ('/api/camera', '/api/capture/session', '/api/calibration/session',
-             '/assets/', '/api/health')
+             '/assets/', '/api/health', '/api/edit/')
 
     def filter(self, record):
         msg = record.getMessage()
@@ -124,14 +128,20 @@ CALIB_ROOT = os.path.join(DATA, 'calibration')
 CALIB_DIR = os.path.join(HERE, 'robospec_umi_calibration')
 CAPTURE_DIR = os.path.join(HERE, 'robospec_umi_capture')
 CAPTURE_ROOT = os.path.join(DATA, 'capture')
+DATASET_DIR = os.path.join(HERE, 'robospec_umi_dataset')
+DATASET_ROOT = os.path.join(DATA, 'dataset')
 ACTIVE_JSON = os.path.join(CALIB_ROOT, 'scene_intrinsics.json')
 
 sys.path.insert(0, CALIB_DIR)
 sys.path.insert(0, CAPTURE_DIR)
+sys.path.insert(0, DATASET_DIR)
 import calibrate_scene_cam as CS                        # noqa: E402
 import scene_cam_charuco_detector as DT                 # noqa: E402
 import preview as PV                                    # noqa: E402
 import capture as CAP                                   # noqa: E402
+import episode_prep as EP                               # noqa: E402
+import timeline as TL                                   # noqa: E402
+import verify as VF                                     # noqa: E402
 
 JPEG_QUALITY = 80
 # Downscaled from 1080p before encoding: the operator is aiming a board, not
@@ -523,6 +533,9 @@ class CapturePreview:
 
 SESSIONS = {}        # 'calibration.capture' | 'capture.session' -> worker
 JOBS = {}            # job_id -> {proc, log[], status, rc}
+# Set on shutdown. Every long-lived stream checks it, or an open browser tab
+# holds Ctrl+C for aiohttp's full 60 s shutdown timeout.
+STOPPING = threading.Event()
 
 
 def _stop_session(name):
@@ -612,22 +625,34 @@ async def camera_release(request):
 # ------------------------------------------------------------ run management
 async def calib_runs(request):
     runs = []
+    bound = await asyncio.to_thread(_bound_runs)
     if os.path.isdir(CALIB_ROOT):
         for d in sorted(os.listdir(CALIB_ROOT)):
             p = os.path.join(CALIB_ROOT, d)
             if os.path.isdir(p):
-                runs.append(run_summary(p))
+                runs.append({**run_summary(p), 'datasets': bound.get(d, 0)})
     runs.sort(key=lambda r: r['mtime'], reverse=True)
     return web.json_response({'runs': runs, 'active': active_summary()})
 
 
 async def calib_delete_run(request):
+    """Deleting the active run deactivates it: datasets bound to it lock."""
     name = request.match_info['name']
     d = os.path.join(CALIB_ROOT, name)
     if os.path.basename(d) != name or not os.path.isdir(d):
         return json_err(404, f'no such run: {name}')
+    busy = [pid for pid in EXPORT_JOBS if _export_running(pid)
+            and ((read_json(_proj_path(pid)) or {}).get('intrinsics') or {}).get('run') == name]
+    if busy:
+        return json_err(409, f'dataset {busy[0]} is exporting with {name}')
+    act = read_json(ACTIVE_JSON) or {}
+    active = act.get('source_run') == name or (
+        _sha1(ACTIVE_JSON) is not None and _sha1(ACTIVE_JSON) == _sha1(_run_json(name)))
     shutil.rmtree(d)
-    return web.json_response({'ok': True, 'deleted': name})
+    if active:
+        os.remove(ACTIVE_JSON)
+    log_cal.info('deleted run %s%s', name, ' (was active: nothing is active now)' if active else '')
+    return web.json_response({'ok': True, 'deleted': name, 'deactivated': active})
 
 
 async def calib_activate(request):
@@ -637,7 +662,71 @@ async def calib_activate(request):
     if os.path.basename(os.path.dirname(src)) != name or not os.path.exists(src):
         return json_err(404, f'{name} has no solved scene_intrinsics.json')
     shutil.copyfile(src, ACTIVE_JSON)
+    log_cal.info('activated %s', name)
     return web.json_response({'ok': True, 'active': active_summary()})
+
+
+INTR_REQUIRED = ('source_run', 'intrinsic_type', 'k', 'd', 'image_width', 'image_height')
+
+
+def _check_intrinsics_upload(raw):
+    """-> (json, warnings). Raises ValueError saying what is wrong."""
+    try:
+        j = json.loads(raw)
+    except ValueError as e:
+        raise ValueError(f'not valid JSON ({e})') from None
+    if not isinstance(j, dict):
+        raise ValueError('not a JSON object')
+    missing = [k for k in INTR_REQUIRED if k not in j]
+    if missing:
+        raise ValueError('missing ' + ', '.join(f"'{k}'" for k in missing))
+    if not isinstance(j['source_run'], str) or not SESS_RE.match(j['source_run']):
+        raise ValueError("'source_run' must be the calibration's datetime, "
+                         "like 20260924_234214")
+    if j['intrinsic_type'] != 'PINHOLE':
+        raise ValueError(f"'intrinsic_type' is {j['intrinsic_type']!r}, expected 'PINHOLE'")
+
+    def num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and np.isfinite(x)
+    if not (isinstance(j['k'], list) and len(j['k']) == 9 and all(map(num, j['k']))):
+        raise ValueError("'k' must be 9 numbers (the 3x3 camera matrix)")
+    if not (isinstance(j['d'], list) and len(j['d']) >= 4 and all(map(num, j['d']))):
+        raise ValueError("'d' must be at least 4 distortion coefficients")
+    for k in ('image_width', 'image_height'):
+        if not (isinstance(j[k], int) and not isinstance(j[k], bool) and j[k] > 0):
+            raise ValueError(f"'{k}' must be a positive integer")
+    lc = j.get('locked_controls')
+    warnings = []
+    if not isinstance(lc, dict) or None in (lc.get('focus_absolute'), lc.get('zoom_absolute')):
+        warnings.append('no locked focus/zoom: sessions cannot be checked against it')
+    return j, warnings
+
+
+async def calib_upload(request):
+    """Import a scene_intrinsics.json as calibration/<source_run>/. Stored
+    byte-for-byte so its sha1 (what datasets bind to) matches the original."""
+    raw = await request.read()
+    try:
+        j, warnings = _check_intrinsics_upload(raw)
+    except ValueError as e:
+        return json_err(400, f'malformed intrinsic file: {e}')
+    run = j['source_run']
+    d = os.path.join(CALIB_ROOT, run)
+    if os.path.exists(d):
+        have = _sha1(_run_json(run))
+        return json_err(409, f'{run} is already imported' if have == hashlib.sha1(raw).hexdigest()
+                        else f'a different calibration run named {run} already exists')
+    os.makedirs(d)
+    dst = _run_json(run)
+    with open(dst + '.tmp', 'wb') as f:
+        f.write(raw)
+    os.replace(dst + '.tmp', dst)
+    activated = not os.path.exists(ACTIVE_JSON)
+    if activated:
+        shutil.copyfile(dst, ACTIVE_JSON)
+    log_cal.info('imported %s%s', run, ' and activated it' if activated else '')
+    return web.json_response({'ok': True, 'run': run, 'activated': activated,
+                              'warnings': warnings})
 
 
 async def calib_active(request):
@@ -873,26 +962,32 @@ async def calib_solve(request):
            os.path.join(CALIB_DIR, 'calibrate_scene_cam.py'), 'solve']
     if frames:
         cmd.append(frames)
+    return web.json_response({'ok': True, 'job_id': _spawn_job(cmd, 'solve', run=run)})
+
+
+def _spawn_job(cmd, tag, **info):
+    """Run cmd as a subprocess in JOBS; its output goes to the UI and the log."""
     jid = uuid.uuid4().hex[:8]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, cwd=REPO)
     job = JOBS[jid] = {'proc': proc, 'log': [], 'status': 'running',
-                       'rc': None, 'run': run}
+                       'rc': None, **info}
 
     def drain():
         # Must run unconditionally, not only while a client is watching: the
-        # pipe buffer is 64 KB and solve would block forever on a full one.
+        # pipe buffer is 64 KB and the child would block forever on a full one.
         for line in proc.stdout:
-            job['log'].append(line.rstrip('\n'))
+            line = line.rstrip('\n')
+            job['log'].append(line)
+            log_job.info('%s | %s', tag, line)
         job['rc'] = proc.wait()
         job['status'] = 'done' if job['rc'] == 0 else 'failed'
         (log_job.info if job['rc'] == 0 else log_job.error)(
-            'job %s %s (rc=%s, %d log lines)', jid, job['status'], job['rc'],
-            len(job['log']))
+            '%s %s (job %s, rc=%s)', tag, job['status'], jid, job['rc'])
 
     threading.Thread(target=drain, daemon=True).start()
-    log_job.info('job %s spawned: %s', jid, ' '.join(cmd))
-    return web.json_response({'ok': True, 'job_id': jid})
+    log_job.info('%s started (job %s): %s', tag, jid, ' '.join(cmd))
+    return jid
 
 
 async def job_log(request):
@@ -908,7 +1003,7 @@ async def job_log(request):
     await resp.prepare(request)
     i = int(request.query.get('frm', 0))
     try:
-        while True:
+        while not STOPPING.is_set():
             while i < len(job['log']):
                 await resp.write(f'data: {json.dumps({"i": i, "line": job["log"][i]})}\n\n'
                                  .encode())
@@ -1172,7 +1267,7 @@ async def _mjpeg(request, name, cam=None):
     # loops beat against each other and silently drops ~12% of frames.
     last = None
     try:
-        while name in SESSIONS:
+        while name in SESSIONS and not STOPPING.is_set():
             jpeg, _ = w.snapshot(cam)
             if jpeg is None or jpeg is last:
                 await asyncio.sleep(0.002)
@@ -1203,11 +1298,13 @@ async def _sse_state(request, name):
     await resp.prepare(request)
     for lz in leases:
         lz.subscribers += 1
-    # A worker with its own state() (the capture session) reports far more than
-    # the per-frame stats in the slot -- episodes, warm-up, arm state.
+    # CapturePreview has a state() method (episodes, warm-up, arm state);
+    # StreamWorker has a `state` dict attribute. Test callable, not presence.
     get_state = getattr(w, 'state', None)
+    if not callable(get_state):
+        get_state = None
     try:
-        while name in SESSIONS:
+        while name in SESSIONS and not STOPPING.is_set():
             state = get_state() if get_state else w.snapshot()[1]
             if state is not None:
                 payload = dict(state)
@@ -1240,6 +1337,663 @@ async def test_state(request):
     return await _sse_state(request, 'calibration.test')
 
 
+# ============================================================ edit (dataset)
+SESS_RE = re.compile(r'^\d{8}_\d{6}$')
+EP_RE = re.compile(r'^ep\d{3}$')
+MEDIA = ('scene_annotated.mp4', 'wrist.mp4')
+STAGES = ('select', 'verify', 'edit', 'export')
+PREP_WORKERS = 2
+EXPORT_JOBS = {}     # project id -> job id
+
+
+def _http(cls, msg):
+    return cls(text=json.dumps({'error': msg}), content_type='application/json')
+
+
+def _recording_dir():
+    w = SESSIONS.get(CAPTURE_KEY)
+    d = getattr(getattr(w, 'session', None), 'dir', None)
+    return os.path.abspath(d) if d else None
+
+
+def _ep_dir(sess, ep):
+    if not (SESS_RE.match(sess) and EP_RE.match(ep)):
+        raise _http(web.HTTPBadRequest, 'bad session or episode name')
+    return os.path.join(CAPTURE_ROOT, sess, ep)
+
+
+def _prep_key():
+    try:
+        return EP.cache_key(ACTIVE_JSON)
+    except OSError:
+        return None
+
+
+# ------------------------------------------------- dataset <-> intrinsic
+def _run_json(run):
+    return os.path.join(CALIB_ROOT, os.path.basename(run), 'scene_intrinsics.json')
+
+
+def _sha1(path):
+    try:
+        return EP.sha1(path)
+    except OSError:
+        return None
+
+
+def _active_binding():
+    """The active intrinsic as a dataset binds to it, or None."""
+    j, sha1 = read_json(ACTIVE_JSON), _sha1(ACTIVE_JSON)
+    if not j or not sha1:
+        return None
+    return {'run': j.get('source_run'), 'sha1': sha1,
+            'solved_at': j.get('solved_at'), 'reproj': j.get('final_reproj_error')}
+
+
+def _migrate(p):
+    """Older projects stored only the sha1: name the run it came from."""
+    b = p.get('intrinsics') or {}
+    if b.get('sha1') and not b.get('run'):
+        act = _active_binding()
+        if act and act['sha1'] == b['sha1']:
+            b['run'] = act['run']
+        elif os.path.isdir(CALIB_ROOT):
+            b['run'] = next((n for n in sorted(os.listdir(CALIB_ROOT))
+                             if _sha1(_run_json(n)) == b['sha1']), None)
+        b.pop('path', None)
+    return p
+
+
+def _intr_state(p, act=None):
+    """ok: bound intrinsic is active. inactive: its run still exists.
+    missing: deleted, re-solved, or never bound."""
+    b = p.get('intrinsics') or {}
+    act = act or _active_binding()
+    if b.get('sha1') and act and act['sha1'] == b['sha1']:
+        status = 'ok'
+    elif b.get('run') and b.get('sha1') and _sha1(_run_json(b['run'])) == b['sha1']:
+        status = 'inactive'
+    else:
+        status = 'missing'
+    return {'run': b.get('run'), 'sha1': b.get('sha1'), 'solved_at': b.get('solved_at'),
+            'status': status, 'active': act}
+
+
+def _require_bound(p):
+    st = _intr_state(p)
+    if st['status'] != 'ok':
+        raise _http(web.HTTPConflict, f'intrinsic {st["run"] or "?"} is not active: '
+                                      f'activate it, or rebind this dataset')
+
+
+def _bound_runs():
+    """run -> number of datasets bound to it."""
+    out = {}
+    if os.path.isdir(DATASET_ROOT):
+        for f in os.listdir(DATASET_ROOT):
+            p = re.match(r'^\d{8}_\d{6}_dataset\.json$', f) and read_json(os.path.join(DATASET_ROOT, f))
+            run = p and _migrate(p).get('intrinsics', {}).get('run')
+            if run:
+                out[run] = out.get(run, 0) + 1
+    return out
+
+
+def _export_running(pid):
+    jid = EXPORT_JOBS.get(pid)
+    return bool(jid) and JOBS.get(jid, {}).get('status') == 'running'
+
+
+def _session_row(name, key):
+    d = os.path.join(CAPTURE_ROOT, name)
+    meta = read_json(os.path.join(d, 'session.json')) or {}
+    eps = _episodes_on_disk(d)
+    size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(d) for f in fs)
+    scene = meta.get('scene', {})
+    return {
+        'name': name, 'episodes': len(eps), 'complete': bool(meta),
+        'duration_s': round(sum(e.get('duration_s', 0) for e in meta.get('episodes', [])), 1),
+        'size_mb': round(size / 1e6, 1),
+        'prepped': sum(bool(key) and EP.is_prepped(os.path.join(d, e), key) for e in eps),
+        'focus': scene.get('focus_absolute'), 'zoom': scene.get('zoom_absolute'),
+    }
+
+
+async def edit_sessions(request):
+    """Capture sessions to pick from; the one still recording is hidden."""
+    if not os.path.isdir(CAPTURE_ROOT):
+        return web.json_response([])
+    rec, key = _recording_dir(), _prep_key()
+    names = [n for n in sorted(os.listdir(CAPTURE_ROOT), reverse=True)
+             if SESS_RE.match(n) and os.path.join(CAPTURE_ROOT, n) != rec]
+    rows = await asyncio.to_thread(lambda: [_session_row(n, key) for n in names])
+    return web.json_response([r for r in rows if r['episodes']])
+
+
+# ------------------------------------------------------------------ projects
+def _proj_path(pid):
+    if not SESS_RE.match(pid or ''):
+        raise _http(web.HTTPBadRequest, 'bad project id')
+    return os.path.join(DATASET_ROOT, f'{pid}_dataset.json')
+
+
+def _load_proj(pid):
+    p = read_json(_proj_path(pid))
+    if p is None:
+        raise _http(web.HTTPNotFound, f'no such project: {pid}')
+    return _migrate(p)
+
+
+def _save_proj(p):
+    p['updated'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    os.makedirs(DATASET_ROOT, exist_ok=True)
+    path = _proj_path(p['id'])
+    with open(path + '.tmp', 'w') as f:
+        json.dump(p, f, indent=2)
+    os.replace(path + '.tmp', path)
+    return p
+
+
+def _proj_episodes(p):
+    """[(session, ep, 'session/ep')] for every episode on disk."""
+    return [(s, e, f'{s}/{e}') for s in p['sessions']
+            for e in _episodes_on_disk(os.path.join(CAPTURE_ROOT, s))]
+
+
+def _verified_ok(p, sess, ep):
+    return (p.get('verify') or {}).get(sess, {}).get('episodes', {}).get(ep, {}).get('ok', False)
+
+
+def _check_sessions(v):
+    if not isinstance(v, list) or not v:
+        raise _http(web.HTTPBadRequest, 'pick at least one session')
+    rec = _recording_dir()
+    for s in v:
+        d = os.path.join(CAPTURE_ROOT, str(s))
+        if not SESS_RE.match(str(s)) or not os.path.isdir(d):
+            raise _http(web.HTTPBadRequest, f'no such session: {s}')
+        if d == rec:
+            raise _http(web.HTTPConflict, f'{s} is still recording')
+    return sorted(set(v))
+
+
+def _clean_trim(t):
+    if not isinstance(t, (list, tuple)) or len(t) != 2:
+        return None
+    a, b = (None if x is None else round(float(x), 4) for x in t)
+    if a is None and b is None:
+        return None
+    if a is not None and b is not None and b <= a:
+        return None
+    return [a, b]
+
+
+def _proj_view(p):
+    """The project plus what only the server knows (a running export, whether
+    its intrinsic is active)."""
+    running = EXPORT_JOBS[p['id']] if _export_running(p['id']) else None
+    return {**p, 'export_job': running, 'intrinsics_state': _intr_state(p)}
+
+
+async def edit_projects(request):
+    rows, act = [], _active_binding()
+    if os.path.isdir(DATASET_ROOT):
+        for f in sorted(os.listdir(DATASET_ROOT), reverse=True):
+            m = re.match(r'^(\d{8}_\d{6})_dataset\.json$', f)
+            p = m and read_json(os.path.join(DATASET_ROOT, f))
+            if not p:
+                continue
+            _migrate(p)
+            eps = _proj_episodes(p)
+            rows.append({
+                'id': p['id'], 'created': p.get('created'), 'updated': p.get('updated'),
+                'stage': p.get('stage'), 'sessions': p['sessions'], 'episodes': len(eps),
+                'included': sum(_verified_ok(p, s, e) and not p['episodes'].get(k, {}).get('excluded')
+                                for s, e, k in eps) if p.get('verify') else None,
+                'export': p.get('export'), 'intrinsics': _intr_state(p, act),
+            })
+    return web.json_response({'projects': rows, 'active': act})
+
+
+async def edit_project_create(request):
+    body = await request.json()
+    sessions = _check_sessions(body.get('sessions'))
+    act = _active_binding()
+    if act is None:
+        raise _http(web.HTTPConflict, 'no scene intrinsic is active: calibrate or upload one first')
+    pid = time.strftime('%Y%m%d_%H%M%S')
+    while os.path.exists(_proj_path(pid)):
+        await asyncio.sleep(1)
+        pid = time.strftime('%Y%m%d_%H%M%S')
+    p = _save_proj({
+        'id': pid, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'), 'stage': 'verify',
+        'sessions': sessions, 'intrinsics': act,
+        'verify': {}, 'episodes': {}, 'export': None,
+    })
+    log_edit.info('project %s created with intrinsic %s: %s', pid, act['run'], ', '.join(sessions))
+    return web.json_response(_proj_view(p))
+
+
+async def edit_project_get(request):
+    return web.json_response(_proj_view(_load_proj(request.match_info['pid'])))
+
+
+async def edit_project_put(request):
+    """Autosave. Only the editable fields; verify and export are server-owned."""
+    body = await request.json()
+    p = _load_proj(request.match_info['pid'])
+    _require_bound(p)
+    if 'sessions' in body:
+        new = _check_sessions(body['sessions'])
+        if new != p['sessions']:
+            p['sessions'] = new
+            p['verify'] = {s: v for s, v in (p.get('verify') or {}).items() if s in new}
+            p['episodes'] = {k: v for k, v in p['episodes'].items()
+                             if k.split('/')[0] in new}
+            p['stage'] = 'verify'
+    for k, v in (body.get('episodes') or {}).items():
+        sess, _, ep = k.partition('/')
+        if sess not in p['sessions'] or not EP_RE.match(ep):
+            continue
+        e = {'excluded': bool(v.get('excluded')), 'trim': _clean_trim(v.get('trim'))}
+        if e['excluded'] or e['trim']:
+            p['episodes'][k] = e
+        else:
+            p['episodes'].pop(k, None)
+    st = body.get('stage')
+    if st in STAGES and STAGES.index(st) > STAGES.index(p.get('stage', 'select')):
+        if st != 'verify' and any(s not in (p.get('verify') or {}) for s in p['sessions']):
+            raise _http(web.HTTPConflict, 'verify every session first')
+        p['stage'] = st
+    return web.json_response(_proj_view(_save_proj(p)))
+
+
+async def edit_project_delete(request):
+    pid = request.match_info['pid']
+    p = _load_proj(pid)
+    if p.get('export'):
+        raise _http(web.HTTPConflict, 'this project has an exported dataset; '
+                                      'delete its files by hand')
+    os.remove(_proj_path(pid))
+    log_edit.info('project %s deleted', pid)
+    return web.json_response({'ok': True})
+
+
+async def edit_project_verify(request):
+    pid = request.match_info['pid']
+    p = _load_proj(pid)
+    _require_bound(p)
+    out = {}
+    for s in p['sessions']:
+        try:
+            r = await asyncio.to_thread(VF.verify_session,
+                                        os.path.join(CAPTURE_ROOT, s), ACTIVE_JSON)
+        except Exception as e:                       # noqa: BLE001
+            log_edit.exception('verify %s crashed', s)
+            r = {'session': s, 'ok': False, 'warnings': [], 'episodes': {}, 'lines': [],
+                 'session_fails': [f'verify crashed: {type(e).__name__}: {e}']}
+        r['ran_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+        out[s] = r
+    p = _load_proj(pid)          # re-read: the UI may have saved meanwhile
+    p['verify'] = out
+    _save_proj(p)
+    eps = _proj_episodes(p)
+    log_edit.info('project %s verified: %d/%d episodes pass', pid,
+                  sum(_verified_ok(p, s, e) for s, e, _ in eps), len(eps))
+    return web.json_response(_proj_view(p))
+
+
+async def edit_project_rebind(request):
+    """Bind to the active intrinsic. Episodes re-prep as they are viewed or
+    exported; verify reruns, since its focus/zoom check depends on it."""
+    pid = request.match_info['pid']
+    p = _load_proj(pid)
+    act = _active_binding()
+    if act is None:
+        raise _http(web.HTTPConflict, 'no scene intrinsic is active')
+    if _export_running(pid):
+        raise _http(web.HTTPConflict, 'this dataset is exporting')
+    old = (p.get('intrinsics') or {}).get('run')
+    p['intrinsics'], p['verify'] = act, {}
+    _save_proj(p)
+    log_edit.info('project %s rebound: intrinsic %s -> %s', pid, old, act['run'])
+    return web.json_response(_proj_view(p))
+
+
+# ---------------------------------------------------------------- prep queue
+class PrepQueue:
+    """episode_prep.py subprocesses in the background, the viewed episode first.
+
+    Starts nothing while a capture is recording or an export is running:
+    detection is CPU-heavy and would cost the recording frames. A project's
+    queued episodes are dropped once nobody has its Edit page open; ones already
+    running finish, since their result is cached. So are queued episodes whose
+    project's intrinsic is no longer the active one.
+    """
+
+    SCRIPT = os.path.join(DATASET_DIR, 'episode_prep.py')
+    SPAN = {'start': (0, 0), 'wrist': (0, 5), 'detect': (5, 70),
+            'track': (70, 72), 'render': (72, 100)}
+
+    def __init__(self):
+        self.jobs = {}       # 'sess/ep' -> {status, stage, i, n, err, meta, proc}
+        self.queue = []
+        self.owners = {}     # 'sess/ep' -> {project ids that asked for it}
+        self.watchers = {}   # project id -> open Edit pages
+        self.focus = None    # the episode someone is looking at
+        self.need = {}       # 'sess/ep' -> intrinsic sha1 it was queued for
+        self.lock = threading.Lock()
+
+    def paused(self):
+        if BROKER.recording(BROKER.DEVICES):
+            return 'recording'
+        if any(JOBS.get(j, {}).get('status') == 'running' for j in EXPORT_JOBS.values()):
+            return 'exporting'
+        return None
+
+    @staticmethod
+    def _summary(meta):
+        return {k: meta.get(k) for k in ('tracked', 'untrimmed', 'duration_s', 'prepared_at')}
+
+    def want(self, keys, focus=None, pid=None, sha1=None):
+        key = _prep_key()
+        with self.lock:
+            for k in keys:
+                j = self.jobs.get(k)
+                if j and j['status'] in ('queued', 'running'):
+                    self.owners.setdefault(k, set()).add(pid)
+                    continue
+                d = os.path.join(CAPTURE_ROOT, k)
+                if key and EP.is_prepped(d, key):
+                    if not j or j['status'] != 'done':
+                        self.jobs[k] = {'status': 'done', 'meta': self._summary(EP.read_prep(d))}
+                    continue
+                if j and j['status'] == 'failed' and k != focus:
+                    continue             # retried only when looked at again
+                self.jobs[k] = {'status': 'queued'}
+                self.queue.append(k)
+                self.need[k] = sha1
+                self.owners.setdefault(k, set()).add(pid)
+            if focus in keys:
+                # the project's queue restarts at the focus: it, the episodes
+                # after it, then wrap back to where it left off
+                self.focus = focus
+                at = keys.index(focus)
+                rank = {k: (i - at) % len(keys) for i, k in enumerate(keys)}
+                mine = sorted((k for k in self.queue if k in rank), key=rank.get)
+                self.queue = mine + [k for k in self.queue if k not in rank]
+        self.pump()
+
+    def pump(self):
+        key = _prep_key()
+        with self.lock:
+            stale = [k for k in self.queue if key is None
+                     or self.need.get(k) != key['intrinsics_sha1']]
+            for k in stale:
+                self.queue.remove(k)
+                self.jobs.pop(k, None)
+                self.need.pop(k, None)
+        if stale:
+            log_edit.info('active intrinsic changed: dropped %d queued prep(s)', len(stale))
+        if key is None or self.paused():
+            return
+        with self.lock:
+            while self.queue:
+                running = sum(j['status'] == 'running' for j in self.jobs.values())
+                # the viewed episode may take one extra slot rather than wait
+                if running < PREP_WORKERS or (running == PREP_WORKERS
+                                              and self.queue[0] == self.focus):
+                    self._spawn(self.queue.pop(0))
+                else:
+                    break
+
+    def _spawn(self, k):
+        self.need.pop(k, None)
+        cmd = [sys.executable, '-u', self.SCRIPT, os.path.join(CAPTURE_ROOT, k),
+               '--intrinsics', ACTIVE_JSON]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, cwd=REPO)
+        job = self.jobs[k] = {'status': 'running', 'stage': 'start', 'i': 0, 'n': 1,
+                              'proc': proc, 'tail': [], 'started': time.time()}
+        log_edit.info('prep %s started', k)
+        threading.Thread(target=self._drain, args=(k, job), daemon=True).start()
+
+    def _drain(self, k, job):
+        proc = job['proc']
+        for line in proc.stdout:
+            line = line.rstrip('\n')
+            if line.startswith('PROGRESS '):
+                _, stage, i, n = line.split()
+                job.update(stage=stage, i=int(i), n=int(n))
+            else:
+                job['tail'] = (job['tail'] + [line])[-20:]
+                log_edit.debug('prep %s | %s', k, line)
+        rc = proc.wait()
+        with self.lock:
+            job['proc'] = None
+            if rc == 0:
+                job['status'] = 'done'
+                job['meta'] = self._summary(EP.read_prep(os.path.join(CAPTURE_ROOT, k)) or {})
+                log_edit.info('prep %s done in %.0fs: %s', k, time.time() - job['started'],
+                              EP.summary(job['meta']) if job['meta'].get('untrimmed') else '?')
+            else:
+                job['status'] = 'failed'
+                job['err'] = next((ln for ln in reversed(job['tail']) if ln.strip()),
+                                  f'exit code {rc}')
+                log_edit.error('prep %s failed (rc=%s):\n%s', k, rc, '\n'.join(job['tail'][-8:]))
+        self.pump()
+
+    def watch(self, pid):
+        with self.lock:
+            self.watchers[pid] = self.watchers.get(pid, 0) + 1
+
+    def unwatch(self, pid):
+        with self.lock:
+            self.watchers[pid] -= 1
+            if self.watchers[pid] > 0:
+                return
+            del self.watchers[pid]
+            dropped = []
+            for k in list(self.owners):
+                self.owners[k].discard(pid)
+                if self.owners[k]:
+                    continue
+                del self.owners[k]
+                if k in self.queue:
+                    self.queue.remove(k)
+                    self.jobs.pop(k, None)
+                    self.need.pop(k, None)
+                    dropped.append(k)
+            running = sum(j['status'] == 'running' for j in self.jobs.values())
+        if dropped:
+            log_edit.info('project %s closed: dropped %d queued prep(s), %d running '
+                          'will finish', pid, len(dropped), running)
+
+    def view(self, keys):
+        out = {}
+        for k in keys:
+            j = self.jobs.get(k)
+            if j is None:
+                continue
+            v = {'status': j['status']}
+            if j['status'] == 'running':
+                lo, hi = self.SPAN.get(j['stage'], (0, 100))
+                v.update(stage=j['stage'], pct=round(lo + (hi - lo) * j['i'] / max(j['n'], 1)))
+            elif j['status'] == 'failed':
+                v['err'] = j.get('err')
+            elif j['status'] == 'done':
+                v['meta'] = j.get('meta')
+            out[k] = v
+        return out
+
+    def stop(self):
+        with self.lock:
+            self.queue.clear()
+            for j in self.jobs.values():
+                if j.get('proc') is not None:
+                    j['proc'].terminate()
+
+
+PREP = PrepQueue()
+
+
+async def edit_prep(request):
+    """Queue prep for the project's verified episodes; `focus` jumps the queue."""
+    p = _load_proj(request.match_info['pid'])
+    _require_bound(p)
+    body = await request.json() if request.can_read_body else {}
+    keys = [k for s, e, k in _proj_episodes(p) if _verified_ok(p, s, e)]
+    focus = body.get('focus')
+    if focus:
+        _ep_dir(*focus.partition('/')[::2])
+        if focus not in keys:
+            keys.append(focus)
+    await asyncio.to_thread(PREP.want, keys, focus, p['id'], p['intrinsics']['sha1'])
+    return web.json_response({'ok': True, 'paused': PREP.paused()})
+
+
+async def edit_prep_state(request):
+    p = _load_proj(request.match_info['pid'])
+    keys = [k for _, _, k in _proj_episodes(p)]
+    resp = web.StreamResponse(headers={
+        'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no'})
+    await resp.prepare(request)
+    PREP.watch(p['id'])
+    last = None
+    try:
+        # aiohttp does not cancel a handler whose client left, and this only
+        # writes on change, so check the connection itself
+        while (request.transport is not None and not request.transport.is_closing()
+               and not STOPPING.is_set()):
+            # re-read: a rebind or an activation elsewhere changes the status
+            cur = _migrate(read_json(_proj_path(p['id'])) or p)
+            txt = json.dumps({'paused': PREP.paused(), 'episodes': PREP.view(keys),
+                              'intrinsics': _intr_state(cur)['status']})
+            if txt != last:
+                await resp.write(f'data: {txt}\n\n'.encode())
+                last = txt
+            await asyncio.sleep(0.5)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        PREP.unwatch(p['id'])
+    return resp
+
+
+async def edit_pump():
+    """Restart the queue once a recording or export ends."""
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            PREP.pump()
+    except asyncio.CancelledError:
+        pass
+
+
+# ------------------------------------------------------------- per episode
+def _require_prepped(d, videos=True):
+    key = _prep_key()
+    if not key or not EP.is_prepped(d, key, videos):
+        raise _http(web.HTTPConflict, 'episode is not prepared yet')
+
+
+def _rpy_deg(R):
+    """(n,3,3) -> (n,3) extrinsic XYZ roll/pitch/yaw in degrees."""
+    return np.degrees(np.stack([np.arctan2(R[:, 2, 1], R[:, 2, 2]),
+                                np.arcsin(np.clip(-R[:, 2, 0], -1, 1)),
+                                np.arctan2(R[:, 1, 0], R[:, 0, 0])], 1))
+
+
+def _decimate(n, most=600):
+    return np.arange(0, n, max(1, -(-n // most)))
+
+
+def _rows(a):
+    return [np.round(r, 2).tolist() if np.isfinite(r).all() else None for r in a]
+
+
+def _timeline(d):
+    """Per-frame status plus the absolute TCP pose (scene-camera frame) and the
+    gripper width, decimated for the graphs. Lost and spike frames are left out
+    of the pose, as export leaves them out."""
+    tr = TL.load_track(d)
+    meta = EP.read_prep(d)
+    t0 = tr['t_ns'][0] / 1e9
+    t = tr['t_ns'] / 1e9 - t0
+    use = tr['tracked'] & (tr['status'] != TL.SPIKE)
+    xyz = np.full((len(t), 3), np.nan)
+    rpy = np.full((len(t), 3), np.nan)
+    if use.any():
+        T = tr['T_tcp'][use]
+        xyz[use] = T[:, :3, 3] * 1000
+        # unwrapped over the kept frames: roll sits near +-180 on this rig
+        rpy[use] = np.degrees(np.unwrap(np.radians(_rpy_deg(T[:, :3, :3])), axis=0))
+    idx = _decimate(len(t))
+    gt, gw = TL.gripper_track(d)
+    gi = _decimate(len(gt))
+    return {
+        't': np.round(t, 4).tolist(), 'status': tr['status'].tolist(),
+        'status_names': TL.STATUS,
+        'tcp': {'t': np.round(t[idx], 4).tolist(),
+                'xyz': _rows(xyz[idx]), 'rpy': _rows(rpy[idx])},
+        'gripper': {'t': np.round(gt[gi] - t0, 4).tolist(),
+                    'width': np.round(gw[gi] * 1000, 2).tolist()},
+        'duration_s': float(t[-1]), 'wrist_offset_s': meta['wrist_offset_s'],
+        'wrist_duration_s': meta['wrist_duration_s'], 'meta': meta,
+    }
+
+
+async def edit_timeline(request):
+    d = _ep_dir(request.match_info['sess'], request.match_info['ep'])
+    _require_prepped(d)
+    return web.json_response(await asyncio.to_thread(_timeline, d))
+
+
+async def edit_plan(request):
+    """What export would keep of this episode, for a given trim."""
+    d = _ep_dir(request.match_info['sess'], request.match_info['ep'])
+    _require_prepped(d, videos=False)
+    q = request.query
+    trim = _clean_trim([q.get('in') or None, q.get('out') or None])
+    r = await asyncio.to_thread(TL.plan_episode, d, trim, False)
+    return web.json_response({k: r[k] for k in
+                              ('usable', 'kept_s', 'spans', 'reason', 'note', 'grid_n')})
+
+
+async def edit_media(request):
+    d = _ep_dir(request.match_info['sess'], request.match_info['ep'])
+    f = request.match_info['file']
+    p = os.path.join(d, TL.DERIVED, f)
+    if f not in MEDIA or not os.path.exists(p):
+        raise _http(web.HTTPNotFound, f'no {f} for this episode')
+    return web.FileResponse(p, headers={'Cache-Control': 'no-cache'})
+
+
+async def edit_export(request):
+    pid = request.match_info['pid']
+    p = _load_proj(pid)
+    if _export_running(pid):
+        return web.json_response({'ok': True, 'job_id': EXPORT_JOBS[pid], 'existing': True})
+    _require_bound(p)
+    if BROKER.recording(BROKER.DEVICES):
+        return json_err(409, 'a capture is recording -- export after it stops')
+    if not any(_verified_ok(p, s, e) and not p['episodes'].get(k, {}).get('excluded')
+               for s, e, k in _proj_episodes(p)):
+        return json_err(400, 'no episodes are included')
+    p['stage'] = 'export'
+    _save_proj(p)
+    # the run's own copy: activating another one mid-export cannot mix them
+    b = p['intrinsics']
+    intr = _run_json(b['run']) if b.get('run') else ACTIVE_JSON
+    if _sha1(intr) != b['sha1']:
+        intr = ACTIVE_JSON
+    cmd = [sys.executable, '-u', os.path.join(DATASET_DIR, 'build_zarr.py'),
+           '--project', _proj_path(pid), '--intrinsics', intr]
+    jid = EXPORT_JOBS[pid] = _spawn_job(cmd, f'export {pid}', project=pid)
+    log_edit.info('project %s export started (job %s)', pid, jid)
+    return web.json_response({'ok': True, 'job_id': jid})
+
+
 # --------------------------------------------------------- run-dir file serve
 async def calib_run_file(request):
     """Serve undistort_preview.png and friends out of a run directory."""
@@ -1270,9 +2024,14 @@ bind-mounted, so no container rebuild is needed.</p>
 """
 
 
+# index.html must revalidate, or a rebuilt UI keeps loading the old bundle;
+# the hashed files under assets/ can cache freely
+NO_CACHE = {'Cache-Control': 'no-cache'}
+
+
 async def index(request):
     if ui_built():
-        return web.FileResponse(os.path.join(UI_DIST, 'index.html'))
+        return web.FileResponse(os.path.join(UI_DIST, 'index.html'), headers=NO_CACHE)
     return web.Response(text=PLACEHOLDER.format(dist=UI_DIST),
                         content_type='text/html')
 
@@ -1285,7 +2044,7 @@ async def spa_fallback(request):
         asset = os.path.normpath(os.path.join(UI_DIST, request.path.lstrip('/')))
         if asset.startswith(UI_DIST) and os.path.isfile(asset):
             return web.FileResponse(asset)
-        return web.FileResponse(os.path.join(UI_DIST, 'index.html'))
+        return web.FileResponse(os.path.join(UI_DIST, 'index.html'), headers=NO_CACHE)
     return await index(request)
 
 
@@ -1326,10 +2085,17 @@ async def idle_reaper(app):
 
 async def on_startup(app):
     app['reaper'] = asyncio.create_task(idle_reaper(app))
+    app['edit_pump'] = asyncio.create_task(edit_pump())
+
+
+async def on_shutdown(app):
+    STOPPING.set()
 
 
 async def on_cleanup(app):
     app['reaper'].cancel()
+    app['edit_pump'].cancel()
+    PREP.stop()
     for name in list(SESSIONS):
         _stop_session(name)
 
@@ -1344,6 +2110,7 @@ def build_app():
     r.add_get('/api/calibration/runs', calib_runs)
     r.add_delete('/api/calibration/runs/{name}', calib_delete_run)
     r.add_post('/api/calibration/activate', calib_activate)
+    r.add_post('/api/calibration/upload', calib_upload)
     r.add_get('/api/calibration/active', calib_active)
     r.add_get('/api/calibration/runs/{name}/file/{file}', calib_run_file)
 
@@ -1386,6 +2153,21 @@ def build_app():
     r.add_get('/api/capture/stream/{cam}', capture_stream)
     r.add_get('/api/capture/state', capture_state)
 
+    r.add_get('/api/edit/sessions', edit_sessions)
+    r.add_get('/api/edit/projects', edit_projects)
+    r.add_post('/api/edit/projects', edit_project_create)
+    r.add_get('/api/edit/projects/{pid}', edit_project_get)
+    r.add_put('/api/edit/projects/{pid}', edit_project_put)
+    r.add_delete('/api/edit/projects/{pid}', edit_project_delete)
+    r.add_post('/api/edit/projects/{pid}/verify', edit_project_verify)
+    r.add_post('/api/edit/projects/{pid}/rebind', edit_project_rebind)
+    r.add_post('/api/edit/projects/{pid}/prep', edit_prep)
+    r.add_get('/api/edit/projects/{pid}/prep/state', edit_prep_state)
+    r.add_post('/api/edit/projects/{pid}/export', edit_export)
+    r.add_get('/api/edit/episode/{sess}/{ep}/timeline', edit_timeline)
+    r.add_get('/api/edit/episode/{sess}/{ep}/plan', edit_plan)
+    r.add_get('/api/edit/media/{sess}/{ep}/{file}', edit_media)
+
     r.add_get('/', index)
     if ui_built():
         assets = os.path.join(UI_DIST, 'assets')
@@ -1394,6 +2176,7 @@ def build_app():
     r.add_route('*', '/{tail:.*}', spa_fallback)
 
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     return app
 
@@ -1417,7 +2200,8 @@ def main():
         format='%(asctime)s %(levelname)-5s [%(threadName)s] %(name)s  %(message)s',
         datefmt='%H:%M:%S')
     log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
-    logging.getLogger('aiohttp.access').addFilter(QuietPaths())
+    if not args.verbose:
+        logging.getLogger('aiohttp.access').addFilter(QuietPaths())
     # On the HANDLER, not on logging.getLogger('libav'): these records come from
     # child loggers (libav.mjpeg, libav.generic), and a filter on a logger only
     # sees records made by that logger -- propagation to an ancestor's handlers

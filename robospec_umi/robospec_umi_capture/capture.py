@@ -806,6 +806,9 @@ class WristRecorder(GatedRecorder):
         # matches the order rows were appended, which would silently break the
         # frame-index-to-timestamp mapping the sidecar depends on.
         st.options = {'preset': 'p4', 'tune': 'ull', 'rc': 'vbr', 'cq': '23', 'bf': '0'}
+        # Open NVENC now. PyAV otherwise opens it on the first encode, and that
+        # ~100 ms GIL hold dropped 6-16 wrist frames at the start of every episode.
+        st.codec_context.open()
         return (out_dir, p, c, st)
 
     def _write(self):
@@ -1479,7 +1482,7 @@ def main():
             print(f'{k} ERROR: {meta[k]["error"]}')
 
     print(f'\n{len(meta["episodes"])} episodes -> {session}')
-    print(f'verify with:\n  python3 {os.path.join(HERE, "verify.py")} {session}')
+    print(f'verify with:\n  python3 {os.path.join(os.path.dirname(HERE), "robospec_umi_dataset", "verify.py")} {session}')
 
 
 if __name__ == '__main__':
