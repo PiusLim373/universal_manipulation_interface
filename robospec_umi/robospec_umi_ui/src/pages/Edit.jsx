@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Plus, Trash2, PackageCheck, PencilLine, Aperture, AlertTriangle, Camera, Upload, Lock } from 'lucide-react'
+import {
+  Plus, Trash2, PackageCheck, PencilLine, Aperture, AlertTriangle, Camera, Upload, Lock, Download, Database,
+} from 'lucide-react'
 import Page from '@/components/Page'
 import { IntrinsicActions, lockReason } from '@/components/IntrinsicLock'
-import { Button } from '@/components/ui/button'
+import { useDatasetUpload } from '@/components/DatasetUpload'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { api } from '@/lib/api'
@@ -88,23 +91,40 @@ function LockStrip({ r, exported, onChange, onError }) {
   )
 }
 
+function FileLink({ file, label }) {
+  return (
+    <a href={api.datasetUrl(file)} download title={`download ${file}`}
+       className={cn(buttonVariants({ size: 'sm', variant: 'ghost' }), 'text-xs gap-1 px-2')}>
+      <Download className="size-3.5" /> {label}
+    </a>
+  )
+}
+
 export default function Edit() {
   const nav = useNavigate()
   const [rows, setRows] = useState(null)
+  const [files, setFiles] = useState([])
   const [active, setActive] = useState(undefined)
   const [err, setErr] = useState(null)
 
   const load = useCallback(async () => {
     try {
       const [d, a] = await Promise.all([api.projects(), api.active()])
-      setRows(d.projects); setActive(a); setErr(null)
+      setRows(d.projects); setFiles(d.files); setActive(a); setErr(null)
     } catch (e) { setErr(e.message); setRows([]) }
   }, [])
   useEffect(() => { load() }, [load])
+  const up = useDatasetUpload(load)
 
   const remove = async (id) => {
     if (!confirm(`Delete draft ${id}? The capture sessions are not touched.`)) return
     try { await api.deleteProject(id); await load() }
+    catch (e) { setErr(e.message) }
+  }
+  const removeDataset = async (file, mb, project) => {
+    if (!confirm(`Delete ${file}${mb != null ? ` (${mb} MB)` : ''}${project ? ' and its project file' : ''}?`
+      + ' The capture sessions are not touched.')) return
+    try { await api.deleteDataset(file); await load() }
     catch (e) { setErr(e.message) }
   }
 
@@ -118,7 +138,7 @@ export default function Edit() {
 
         {active !== undefined && <IntrinsicBanner active={active} />}
 
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="font-heading font-medium">Datasets</h2>
             <p className="text-sm text-muted-foreground">
@@ -126,16 +146,21 @@ export default function Edit() {
               a <code>.zarr.zip</code> for training.
             </p>
           </div>
-          <Link to="/edit/new/select" className={cn(!active && 'pointer-events-none')}>
-            <Button size="sm" disabled={!active}><Plus className="size-4" /> New dataset</Button>
-          </Link>
+          <div className="flex gap-2 shrink-0">
+            {up.button}
+            <Link to="/edit/new/select" className={cn(!active && 'pointer-events-none')}>
+              <Button size="sm" disabled={!active}><Plus className="size-4" /> New dataset</Button>
+            </Link>
+          </div>
         </div>
+        {up.panel}
 
         {rows === null ? (
           <p className="text-sm text-muted-foreground">loading…</p>
-        ) : rows.length === 0 ? (
+        ) : rows.length === 0 && files.length === 0 ? (
           <Card><CardContent className="pt-6 text-sm text-muted-foreground">
-            No datasets yet. Start one from the sessions in <code>data/capture/</code>.
+            No datasets yet. Start one from the sessions in <code>data/capture/</code>, or
+            upload a <code>.zarr.zip</code>.
           </CardContent></Card>
         ) : null}
 
@@ -169,23 +194,63 @@ export default function Edit() {
         {done.length > 0 && (
           <section className="space-y-2">
             <h3 className="text-sm font-medium text-muted-foreground">Exported</h3>
-            {done.map((r) => (
-              <Card key={r.id}><CardContent className="pt-6"><div className="flex items-center gap-4">
-                <PackageCheck className="size-5 text-[#22c55e] shrink-0" />
+            {done.map((r) => {
+              const zip = `${r.id}_dataset.zarr.zip`
+              // uploaded here from another machine: train-only, the intrinsic is informational
+              const st = r.local ? r.intrinsics : { ...r.intrinsics, status: 'ok' }
+              return (
+                <Card key={r.id}><CardContent className="pt-6"><div className="flex items-center gap-4">
+                  <PackageCheck className="size-5 text-[#22c55e] shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium flex items-center gap-2">
+                      {zip}
+                      {!r.local && <Badge variant="secondary" title={r.uploaded ? `uploaded ${r.uploaded}` : undefined}>uploaded</Badge>}
+                    </div>
+                    <div className="text-xs text-muted-foreground truncate">
+                      {r.export.episodes} episodes · {r.export.steps} steps ({r.export.duration_s} s)
+                      · {r.zip_mb != null ? `${r.zip_mb} MB` : <span className="text-destructive">zip missing</span>}
+                      {' '}· exported {r.export.at?.replace('T', ' ')}
+                    </div>
+                  </div>
+                  <span title="the intrinsic this .zarr.zip was built with">
+                    <IntrinsicBadge st={st} built={r.export.intrinsics?.run} />
+                  </span>
+                  <div className="flex items-center">
+                    {r.zip_mb != null && <FileLink file={zip} label="zip" />}
+                    <FileLink file={`${r.id}_dataset.json`} label="json" />
+                  </div>
+                  <Button size="sm" variant="outline" disabled={!r.local || r.intrinsics.status !== 'ok'}
+                          title={r.local ? undefined : 'its capture sessions are not on this machine'}
+                          onClick={() => nav(`/edit/${r.id}/edit`)}>Open</Button>
+                  <Button size="sm" variant="ghost" onClick={() => removeDataset(zip, r.zip_mb, true)}
+                          title="Delete dataset">
+                    <Trash2 className="size-4" />
+                  </Button>
+                </div>
+                {r.local && r.intrinsics.status !== 'ok' && <LockStrip r={r} exported onChange={load} onError={setErr} />}
+                </CardContent></Card>
+              )
+            })}
+          </section>
+        )}
+
+        {files.length > 0 && (
+          <section className="space-y-2">
+            <h3 className="text-sm font-medium text-muted-foreground">Other datasets</h3>
+            {files.map((f) => (
+              <Card key={f.file}><CardContent className="pt-6 flex items-center gap-4">
+                <Database className="size-5 text-muted-foreground shrink-0" />
                 <div className="flex-1 min-w-0">
-                  <div className="font-medium">{r.id}_dataset.zarr.zip</div>
-                  <div className="text-xs text-muted-foreground truncate">
-                    {r.export.episodes} episodes · {r.export.steps} steps ({r.export.duration_s} s)
-                    · {r.export.size_mb} MB · exported {r.export.at?.replace('T', ' ')}
+                  <div className="font-medium">{f.file}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {f.size_mb} MB · {new Date(f.mtime * 1000).toLocaleString()} · no project file
                   </div>
                 </div>
-                <span title="the intrinsic this .zarr.zip was built with">
-                  <IntrinsicBadge st={r.intrinsics} built={r.export.intrinsics?.run} />
-                </span>
-                <Button size="sm" variant="outline" disabled={r.intrinsics.status !== 'ok'}
-                        onClick={() => nav(`/edit/${r.id}/edit`)}>Open</Button>
-              </div>
-              {r.intrinsics.status !== 'ok' && <LockStrip r={r} exported onChange={load} onError={setErr} />}
+                <FileLink file={f.file} label="zip" />
+                <Button size="sm" variant="ghost" onClick={() => removeDataset(f.file, f.size_mb, false)}
+                        title="Delete dataset">
+                  <Trash2 className="size-4" />
+                </Button>
               </CardContent></Card>
             ))}
           </section>

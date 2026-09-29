@@ -397,9 +397,26 @@ is lost. The per-episode summary says what was thrown away and why.
 
 ## 4. Training
 
-*Not yet migrated.* Training currently runs from the repo root against
-`diffusion_policy/config/train_diffusion_unet_timm_umi_workspace.yaml`, logging
-to wandb, writing checkpoints under `data/outputs/<date>/`.
+The **Training** page does not run anything itself. It builds the `train.py`
+command for you to paste into a terminal:
+
+1. Pick a `.zarr.zip` from `data/dataset/`, or upload one.
+2. Set the hyperparameters. The defaults are the last GCP run: batch 16,
+   workers 10/4, gradient accumulation 4, warmup 500, top-k 3.
+3. **Generate command**. It is a `docker exec … robospec_umi python train.py …`
+   one-liner, or a plain `python train.py …` when the server runs on the host.
+   Paste it into a terminal on the machine running the container, not inside it.
+
+Checkpoints land in `data/outputs/<date>/<time>_…/checkpoints/`. The page lists
+them with the run's epoch and loss, refreshed every 10 s, and a Download button.
+
+On a remote GPU box, run the container there and open the UI from your own
+machine. Upload the dataset from **Edit dataset** or the Training page: the
+`.zarr.zip`, plus its `_dataset.json` if you want episode counts shown. Start
+training inside `tmux` so it survives the SSH session:
+`tmux new -s umi_train`, paste, `Ctrl+b d` to detach, `tmux attach -t umi_train`
+to come back. Then download the checkpoints. The server has no login, so keep
+port 8080 off the public internet.
 
 ---
 

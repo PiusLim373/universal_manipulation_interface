@@ -15,7 +15,8 @@ const FEATURES = [
     desc: 'Verify, trim and pick episodes, then export the training dataset.',
     ready: true },
   { id: 'training', to: '/training', icon: Brain, title: 'Training',
-    desc: 'Train a diffusion policy and watch the run.' },
+    desc: 'Generate the training command and download the checkpoints.',
+    ready: true },
   { id: 'evaluation', to: '/evaluation', icon: FlaskConical, title: 'Evaluation',
     desc: 'Score a checkpoint against recorded data, with no robot attached.' },
 ]

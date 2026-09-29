@@ -39,9 +39,11 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 
 import cv2
 import numpy as np
+import yaml
 from aiohttp import web
 
 # OpenCV/TBB defaults to one worker per core (16 here). Only the resize
@@ -73,6 +75,7 @@ log_cap = log.getChild('capture')     # recording lifecycle
 log_job = log.getChild('job')         # subprocesses
 log_edit = log.getChild('edit')       # dataset editing + prep queue
 log_cal = log.getChild('calibration')  # activate / import / delete
+log_train = log.getChild('train')     # checkpoint downloads
 
 
 class QuietLibav(logging.Filter):
@@ -114,7 +117,7 @@ class QuietPaths(logging.Filter):
     """
 
     NOISY = ('/api/camera', '/api/capture/session', '/api/calibration/session',
-             '/assets/', '/api/health', '/api/edit/')
+             '/assets/', '/api/health', '/api/edit/', '/api/train/')
 
     def filter(self, record):
         msg = record.getMessage()
@@ -130,6 +133,9 @@ CAPTURE_DIR = os.path.join(HERE, 'robospec_umi_capture')
 CAPTURE_ROOT = os.path.join(DATA, 'capture')
 DATASET_DIR = os.path.join(HERE, 'robospec_umi_dataset')
 DATASET_ROOT = os.path.join(DATA, 'dataset')
+OUTPUTS_ROOT = os.path.join(DATA, 'outputs')
+TRAIN_CONFIG = os.path.join(REPO, 'diffusion_policy', 'config',
+                            'train_diffusion_unet_timm_umi_workspace.yaml')
 ACTIVE_JSON = os.path.join(CALIB_ROOT, 'scene_intrinsics.json')
 
 sys.path.insert(0, CALIB_DIR)
@@ -1544,14 +1550,19 @@ async def edit_projects(request):
                 continue
             _migrate(p)
             eps = _proj_episodes(p)
+            z = os.path.join(DATASET_ROOT, f'{p["id"]}_dataset.zarr.zip')
             rows.append({
                 'id': p['id'], 'created': p.get('created'), 'updated': p.get('updated'),
                 'stage': p.get('stage'), 'sessions': p['sessions'], 'episodes': len(eps),
                 'included': sum(_verified_ok(p, s, e) and not p['episodes'].get(k, {}).get('excluded')
                                 for s, e, k in eps) if p.get('verify') else None,
                 'export': p.get('export'), 'intrinsics': _intr_state(p, act),
+                'local': all(os.path.isdir(os.path.join(CAPTURE_ROOT, s)) for s in p['sessions']),
+                'uploaded': p.get('uploaded'),
+                'zip_mb': round(os.path.getsize(z) / 1e6, 1) if os.path.isfile(z) else None,
             })
-    return web.json_response({'projects': rows, 'active': act})
+    files = [d for d in _datasets() if not d['project']]
+    return web.json_response({'projects': rows, 'active': act, 'files': files})
 
 
 async def edit_project_create(request):
@@ -1612,7 +1623,7 @@ async def edit_project_delete(request):
     p = _load_proj(pid)
     if p.get('export'):
         raise _http(web.HTTPConflict, 'this project has an exported dataset; '
-                                      'delete its files by hand')
+                                      'delete the dataset instead')
     os.remove(_proj_path(pid))
     log_edit.info('project %s deleted', pid)
     return web.json_response({'ok': True})
@@ -1994,6 +2005,270 @@ async def edit_export(request):
     return web.json_response({'ok': True, 'job_id': jid})
 
 
+# ------------------------------------------------------------ dataset files
+ZIP_RE = re.compile(r'^[\w-][\w.-]*\.zarr\.zip$')
+PROJ_RE = re.compile(r'^(\d{8}_\d{6})_dataset\.json$')
+UPLOAD_JSON_MAX = 10 << 20
+
+
+def _ds_path(name):
+    if not (ZIP_RE.match(name or '') or PROJ_RE.match(name or '')):
+        raise _http(web.HTTPBadRequest, f'bad dataset file name: {name}')
+    return os.path.join(DATASET_ROOT, name)
+
+
+def _zip_id(name):
+    m = re.match(r'^(\d{8}_\d{6})_dataset\.zarr\.zip$', name)
+    return m.group(1) if m else None
+
+
+def _is_zarr_zip(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
+    return ('.zgroup' in names and 'meta/episode_ends/.zarray' in names
+            and any(n.startswith('data/') for n in names))
+
+
+def _datasets():
+    """Every .zarr.zip, newest first, with its project's export summary."""
+    out = []
+    if not os.path.isdir(DATASET_ROOT):
+        return out
+    for f in os.listdir(DATASET_ROOT):
+        if not ZIP_RE.match(f):
+            continue
+        st = os.stat(os.path.join(DATASET_ROOT, f))
+        pid = _zip_id(f)
+        p = read_json(_proj_path(pid)) if pid else None
+        e = (p or {}).get('export') or {}
+        b = e.get('intrinsics') or (_migrate(p).get('intrinsics') if p else None) or {}
+        out.append({'file': f, 'id': pid, 'project': bool(p), 'uploaded': (p or {}).get('uploaded'),
+                    'size_mb': round(st.st_size / 1e6, 1), 'mtime': st.st_mtime,
+                    'episodes': e.get('episodes'), 'steps': e.get('steps'),
+                    'duration_s': e.get('duration_s'), 'intrinsic': b.get('run')})
+    return sorted(out, key=lambda d: d['mtime'], reverse=True)
+
+
+async def datasets_list(request):
+    return web.json_response(await asyncio.to_thread(_datasets))
+
+
+async def datasets_upload(request):
+    """Raw-body upload into data/dataset/: a .zarr.zip (streamed, so only disk
+    limits it), or the <id>_dataset.json that goes with one already here."""
+    name = request.query.get('name', '')
+    path = _ds_path(name)
+    if os.path.exists(path):
+        return json_err(409, f'{name} already exists here')
+    os.makedirs(DATASET_ROOT, exist_ok=True)
+    if name.endswith('.json'):
+        return await _upload_project(request, name)
+
+    need = request.content_length or 0
+    free = shutil.disk_usage(DATASET_ROOT).free
+    if need + (1 << 30) > free:
+        return json_err(507, f'not enough disk: {need / 1e9:.1f} GB upload, '
+                             f'{free / 1e9:.1f} GB free')
+    part = os.path.join(DATASET_ROOT, f'.{name}.part')
+    size, done = 0, False
+    try:
+        try:
+            with open(part, 'wb') as f:
+                async for chunk in request.content.iter_chunked(1 << 20):
+                    f.write(chunk)
+                    size += len(chunk)
+        except ConnectionResetError:
+            log_edit.warning('upload of %s dropped at %.0f MB', name, size / 1e6)
+            return json_err(400, 'connection lost')
+        if need and size != need:
+            return json_err(400, f'{name}: upload cut short at {size / 1e6:.0f} MB')
+        if not await asyncio.to_thread(_is_zarr_zip, part):
+            return json_err(400, f'{name} is not a dataset .zarr.zip')
+        os.replace(part, path)
+        done = True
+    finally:
+        if not done and os.path.exists(part):
+            os.remove(part)
+    log_edit.info('uploaded %s (%.1f MB)', name, size / 1e6)
+    return web.json_response({'ok': True, 'file': name, 'size_mb': round(size / 1e6, 1)})
+
+
+async def _upload_project(request, name):
+    raw = b''
+    async for chunk in request.content.iter_chunked(1 << 16):
+        raw += chunk
+        if len(raw) > UPLOAD_JSON_MAX:
+            return json_err(413, f'{name} is too big for a project file')
+    pid = PROJ_RE.match(name).group(1)
+    try:
+        p = json.loads(raw)
+    except ValueError as e:
+        return json_err(400, f'{name} is not valid JSON ({e})')
+    if not isinstance(p, dict) or p.get('id') != pid or not isinstance(p.get('sessions'), list):
+        return json_err(400, f'{name} is not a dataset project file for {pid}')
+    if not os.path.exists(os.path.join(DATASET_ROOT, f'{pid}_dataset.zarr.zip')):
+        return json_err(409, f'upload {pid}_dataset.zarr.zip first')
+    p.setdefault('episodes', {})
+    p['uploaded'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    _save_proj(p)
+    log_edit.info('uploaded %s', name)
+    return web.json_response({'ok': True, 'file': name})
+
+
+async def datasets_download(request):
+    name = request.match_info['file']
+    path = _ds_path(name)
+    if not os.path.isfile(path):
+        raise _http(web.HTTPNotFound, f'no {name}')
+    return web.FileResponse(path, headers={
+        'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+async def datasets_delete(request):
+    """The whole dataset: the .zarr.zip and its project json, if any."""
+    name = request.match_info['file']
+    if not ZIP_RE.match(name):
+        raise _http(web.HTTPBadRequest, 'name the .zarr.zip')
+    pid = _zip_id(name)
+    if pid and _export_running(pid):
+        raise _http(web.HTTPConflict, f'{pid} is exporting')
+    gone = [f for f in (_ds_path(name), pid and _proj_path(pid)) if f and os.path.exists(f)]
+    if not gone:
+        raise _http(web.HTTPNotFound, f'no {name}')
+    for f in gone:
+        os.remove(f)
+    log_edit.info('deleted dataset %s', ', '.join(os.path.basename(f) for f in gone))
+    return web.json_response({'ok': True, 'deleted': [os.path.basename(f) for f in gone]})
+
+
+# ------------------------------------------------------------------ training
+CONTAINER = 'robospec_umi'   # container_name in robospec_umi_compose.yaml
+_YAML = {}                   # path -> (mtime, parsed)
+
+
+def _read_yaml(path):
+    try:
+        mt = os.path.getmtime(path)
+        if _YAML.get(path, (None,))[0] != mt:
+            with open(path) as f:
+                _YAML[path] = (mt, yaml.safe_load(f))
+        return _YAML[path][1]
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+async def train_info(request):
+    cfg = _read_yaml(TRAIN_CONFIG) or {}
+    tr = cfg.get('training') or {}
+    return web.json_response({
+        'in_container': os.path.exists('/.dockerenv'), 'container': CONTAINER, 'repo': REPO,
+        'config': os.path.splitext(os.path.basename(TRAIN_CONFIG))[0],
+        'defaults': {'num_epochs': tr.get('num_epochs'), 'checkpoint_every': tr.get('checkpoint_every'),
+                     'lr': (cfg.get('optimizer') or {}).get('lr')},
+    })
+
+
+async def train_gpu(request):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'nvidia-smi', '--query-gpu=name,memory.used,memory.total,utilization.gpu',
+            '--format=csv,noheader,nounits',
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return web.json_response({'error': 'nvidia-smi not found'})
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 3)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return web.json_response({'error': 'nvidia-smi timed out'})
+
+    def num(v):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    gpus = []
+    for line in out.decode().splitlines():
+        f = [x.strip() for x in line.split(',')]
+        if len(f) == 4:
+            gpus.append({'name': f[0], 'mem_used_mb': num(f[1]), 'mem_total_mb': num(f[2]),
+                         'util': num(f[3])})
+    return web.json_response({'gpus': gpus} if gpus else {'error': 'no GPU reported'})
+
+
+def _last_json_line(path):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4096))
+            lines = f.read().decode(errors='replace').splitlines()
+    except OSError:
+        return None
+    for ln in reversed(lines):
+        try:
+            return json.loads(ln)
+        except ValueError:
+            continue
+    return None
+
+
+def _runs():
+    """Training runs under data/outputs, newest activity first. A checkpoint
+    belongs to its directory, or the run above a checkpoints/ directory."""
+    runs = {}
+    now = time.time()
+    for root, dirs, files in os.walk(OUTPUTS_ROOT):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'wandb']
+        run = os.path.dirname(root) if os.path.basename(root) == 'checkpoints' else root
+        ckpts = [f for f in files if f.endswith('.ckpt')]
+        if ckpts or 'logs.json.txt' in files:
+            runs.setdefault(run, [])
+        for f in ckpts:
+            st = os.stat(os.path.join(root, f))
+            runs[run].append({'path': os.path.relpath(os.path.join(root, f), OUTPUTS_ROOT),
+                              'name': f, 'size_mb': round(st.st_size / 1e6, 1),
+                              'mtime': st.st_mtime, 'saving': now - st.st_mtime < 30})
+    out = []
+    for run, ckpts in runs.items():
+        logp = os.path.join(run, 'logs.json.txt')
+        cfg = _read_yaml(os.path.join(run, '.hydra', 'config.yaml')) or {}
+        ov = _read_yaml(os.path.join(run, '.hydra', 'overrides.yaml')) or []
+        last = _last_json_line(logp)
+        seen = [c['mtime'] for c in ckpts] + ([os.path.getmtime(logp)] if last else [])
+        out.append({
+            'run': os.path.relpath(run, OUTPUTS_ROOT),
+            'dataset': next((o.split('=', 1)[1] for o in ov if isinstance(o, str)
+                             and o.startswith('task.dataset_path=')), None),
+            'num_epochs': (cfg.get('training') or {}).get('num_epochs'),
+            'progress': last and {k: last.get(k) for k in ('epoch', 'global_step', 'train_loss')},
+            'running': bool(last) and now - os.path.getmtime(logp) < 120,
+            'updated': max(seen, default=os.path.getmtime(run)),
+            'checkpoints': sorted(ckpts, key=lambda c: c['mtime'], reverse=True),
+        })
+    return sorted(out, key=lambda r: r['updated'], reverse=True)
+
+
+async def train_runs(request):
+    return web.json_response(await asyncio.to_thread(_runs))
+
+
+async def train_ckpt(request):
+    rel = request.query.get('path', '')
+    root = os.path.realpath(OUTPUTS_ROOT)
+    path = os.path.realpath(os.path.join(root, rel))
+    if not (path.startswith(root + os.sep) and path.endswith('.ckpt') and os.path.isfile(path)):
+        raise _http(web.HTTPNotFound, f'no checkpoint {rel}')
+    # the run in the name, so latest.ckpt from two runs cannot collide
+    name = os.path.relpath(path, root).replace(os.sep + 'checkpoints' + os.sep, os.sep)
+    name = name.replace(os.sep, '_')
+    log_train.info('download %s (%.0f MB)', rel, os.path.getsize(path) / 1e6)
+    return web.FileResponse(path, headers={
+        'Content-Disposition': f'attachment; filename="{name}"'})
+
+
 # --------------------------------------------------------- run-dir file serve
 async def calib_run_file(request):
     """Serve undistort_preview.png and friends out of a run directory."""
@@ -2167,6 +2442,15 @@ def build_app():
     r.add_get('/api/edit/episode/{sess}/{ep}/timeline', edit_timeline)
     r.add_get('/api/edit/episode/{sess}/{ep}/plan', edit_plan)
     r.add_get('/api/edit/media/{sess}/{ep}/{file}', edit_media)
+
+    r.add_get('/api/datasets', datasets_list)
+    r.add_post('/api/datasets/upload', datasets_upload)
+    r.add_get('/api/datasets/{file}', datasets_download)
+    r.add_delete('/api/datasets/{file}', datasets_delete)
+    r.add_get('/api/train/info', train_info)
+    r.add_get('/api/train/gpu', train_gpu)
+    r.add_get('/api/train/runs', train_runs)
+    r.add_get('/api/train/ckpt', train_ckpt)
 
     r.add_get('/', index)
     if ui_built():

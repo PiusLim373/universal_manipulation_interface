@@ -7,6 +7,7 @@ import CaptureNew from '@/pages/CaptureNew'
 import Edit from '@/pages/Edit'
 import EditProject from '@/pages/EditProject'
 import Placeholder from '@/pages/Placeholder'
+import Training from '@/pages/Training'
 
 // Real routes rather than a useState switch: a calibration capture session lives
 // on the server, so a refresh mid-run should land you back on the same stage
@@ -27,10 +28,7 @@ export default function App() {
         <Route path="/edit" element={<Edit />} />
         <Route path="/edit/:pid" element={<Navigate to="select" replace />} />
         <Route path="/edit/:pid/:stage" element={<EditProject />} />
-        <Route path="/training" element={
-          <Placeholder title="Training"
-            blurb="Train a diffusion policy and follow the run."
-            cli={'python train.py --config-name=train_diffusion_unet_timm_umi_workspace \\\n  task.dataset_path=data/dataset/<datetime>_dataset.zarr.zip'} />} />
+        <Route path="/training" element={<Training />} />
         <Route path="/evaluation" element={
           <Placeholder title="Evaluation"
             blurb="Score a checkpoint against recorded data, with no robot attached."
