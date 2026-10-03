@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Synchronised dual-camera episode recorder: scene (ChArUco tracking) + D405 (wrist).
+"""Synchronised dual-camera episode recorder: scene (ChArUco tracking) + RealSense
+D405 or D455 (wrist).
 
 Both cameras stream continuously from launch and are *gated* per episode: frames are
 pulled and discarded until you arm an episode, then written until you stop. Nothing is
@@ -12,10 +13,11 @@ that transient at the *start of every episode*, which is the part you least want
 corrupted. Streaming continuously pays it once, during warm-up, while nothing is
 being recorded.
 
-Exposure AND white balance are locked on both cameras. Auto exposure moves the
+Exposure AND white balance are locked on the scene camera. Auto exposure moves the
 exposure midpoint frame to frame, which turns the constant camera-to-camera offset
 into time-varying noise; auto white balance makes the same scene change colour between
-episodes, which is a spurious signal for the policy to latch onto.
+episodes, which is a spurious signal for the policy to latch onto. The D455 wrist runs
+both on auto by default, by choice (see WRIST_MODELS).
 
 Sync is established after the fact: every frame carries its own timestamp on a shared
 CLOCK_MONOTONIC timeline, and post-processing interpolates the pose track onto wrist
@@ -143,24 +145,48 @@ SCENE_ZOOM = 100
 # the top of the exposure range, because exposure_dynamic_framerate is 0.
 SCENE_FPS = 120
 
-WRIST_SIZE = (848, 480)     # the D405 has no 1080p; 848x480 is what does 90 fps
-WRIST_FPS = 90
 ENCODER = 'h264_nvenc'
 
-# What the wrist offers a UI. Exposure is deliberately NOT accompanied by an auto
-# toggle: measured, the D405's auto exposure pins gain at the sensor floor (16)
-# and relies on integration time alone, landing at mean luma ~10 against ~62 for
-# manual 6000us/gain 248. It is tuned for the stereo depth pipeline, where a
-# short, dark, low-noise frame is what you want, not for RGB appearance. Auto
-# white balance is fine -- no frame-rate or brightness cost -- and is offered.
-WRIST_TUNABLE = ('exposure', 'gain', 'white_balance',
+# Per wrist camera, picked by device name at session start. Exposure here is in us
+# whatever the camera's own unit; the recorder converts on write. auto_exposure is
+# its default, or None where it is not offered at all.
+WRIST_MODELS = {
+    # Colour comes off the stereo module. MEASURED cliff: 10000 us holds 89.9 fps,
+    # 11000 gives exactly 60.0, 20000 gives 30.0 -- with ZERO dropped frames, it
+    # silently renegotiates to a slower divisor of 90, so the slider stops before
+    # it. No auto exposure: it pins gain at the sensor floor (16) and lands at mean
+    # luma ~10 against ~62 for manual 6000 us / gain 248 -- tuned for the stereo
+    # depth pipeline, not RGB appearance.
+    'D405': {'size': (848, 480), 'fps': 90, 'exposure_unit_us': 1,
+             'exposure_us': 6000, 'exposure_max_us': 10000, 'gain': 248,
+             'auto_exposure': None},
+    # A separate RGB sensor, exposure in 100 us, gain 0..128. 848x480 tops out at
+    # 60 fps and is broken on this unit, hence 640x360. Manual 1..109 (10.9 ms)
+    # holds 89.9 fps; 110-111 give black frames, longer lowers the rate. Auto
+    # exposure holds 90 fps with auto_exposure_priority 0, so it is the default.
+    # See d455_test/d455_documentation.md.
+    'D455': {'size': (640, 360), 'fps': 90, 'exposure_unit_us': 100,
+             'exposure_us': 6000, 'exposure_max_us': 10900, 'gain': 64,
+             'auto_exposure': True},
+}
+
+# What the wrist offers a UI; enable_auto_exposure only where the model allows it.
+# Auto white balance is fine on both -- no frame-rate or brightness cost.
+WRIST_TUNABLE = ('enable_auto_exposure', 'exposure', 'gain', 'white_balance',
                  'enable_auto_white_balance', 'gamma')
-# MEASURED cliff, not a guess: 10000us holds 89.9 fps, 11000 gives exactly 60.0,
-# 20000 gives 30.0, 33000 gives 15.0 -- with ZERO dropped frames each time. The
-# camera does not drop frames when the exposure exceeds the 11111us frame period,
-# it silently renegotiates to a slower divisor of 90, which is why nothing
-# downstream notices. Stop the slider before the cliff.
-WRIST_USEFUL_EXPOSURE_MAX = 10000
+
+
+def wrist_model():
+    """-> the WRIST_MODELS key of the connected RealSense. Reads its name only;
+    options are only ever written through the started pipeline (see _configure)."""
+    devs = rs.context().query_devices()
+    if len(devs) == 0:
+        raise RecordError('no RealSense camera found')
+    name = devs[0].get_info(rs.camera_info.name)
+    for k in WRIST_MODELS:
+        if k in name:
+            return k
+    raise RecordError(f'{name} is not a supported wrist camera ({", ".join(WRIST_MODELS)})')
 
 # Arduino on the gripper (arduino/UMI_Force_Angle.ino): '<opening>_<force>' lines at
 # ~40 Hz. The opening is a pot reading, linear in finger gap from 0 (closed) to
@@ -579,7 +605,10 @@ class SceneRecorder(GatedRecorder):
 
 # -------------------------------------------------------------- wrist camera
 class WristRecorder(GatedRecorder):
-    """D405 colour via librealsense, encoded with NVENC.
+    """RealSense colour (a WRIST_MODELS entry) via librealsense, encoded with NVENC.
+
+    Exposure is in us everywhere outside this class -- the UI, session.json -- and
+    converted to the model's own unit only when written to the camera.
 
     Timestamps come from the device, not from arrival in Python: the device stamp
     jitters by ~0.02 ms where arrival jitters by ~0.09 ms and lags by ~8 ms. That needs
@@ -587,19 +616,26 @@ class WristRecorder(GatedRecorder):
     keeps re-fitting it, so the camera's clock drift is tracked instead of accumulating.
     """
 
-    def __init__(self, width, height, fps, mono2epoch, encoder='h264_nvenc',
-                 exposure_us=5000, gain=None, wb_temp=4600, auto_wb=False,
+    def __init__(self, model, mono2epoch, encoder='h264_nvenc', exposure_us=None,
+                 gain=None, wb_temp=4600, auto_wb=True, auto_exposure=None,
                  queue_size=32, qsize=256):
         super().__init__(qsize)
-        self.size, self.fps, self.mono2epoch = (width, height), fps, mono2epoch
+        m = WRIST_MODELS[model]
+        self.model, self.spec = model, m
+        self.size, self.fps, self.mono2epoch = m['size'], m['fps'], mono2epoch
+        self.unit = m['exposure_unit_us']
         self.encoder = encoder
-        self.exposure_us, self.gain = exposure_us, gain
+        self.exposure_us = m['exposure_us'] if exposure_us is None else exposure_us
+        self.gain = m['gain'] if gain is None else gain
         self.wb_temp, self.queue_size = wb_temp, queue_size
         self.auto_wb = bool(auto_wb)
+        self.ae_offered = m['auto_exposure'] is not None
+        self.auto_exp = self.ae_offered and bool(
+            m['auto_exposure'] if auto_exposure is None else auto_exposure)
         self.rows, self.out_dir, self.path = [], None, None
         self.domains = set()
         self.settings = {}          # filled in once the pipeline is up
-        self.checkpoint = max(fps, 1)
+        self.checkpoint = max(self.fps, 1)
         # Live control surface, all populated in _configure on the started
         # pipeline. `wanted` is a shadow of every value we have written, and it
         # is what controls() reports -- see the comment there.
@@ -620,7 +656,9 @@ class WristRecorder(GatedRecorder):
         exactly once and has been exercised repeatedly without trouble.
         """
         dev = prof.get_device()
-        s = dev.query_sensors()[0]
+        # the stereo module on the D405, a separate RGB camera on the D455 --
+        # where writes to sensors[0] land on the depth module, silently
+        s = dev.first_color_sensor()
         out = {'name': dev.get_info(rs.camera_info.name),
                'serial': dev.get_info(rs.camera_info.serial_number),
                'firmware': dev.get_info(rs.camera_info.firmware_version)}
@@ -636,13 +674,21 @@ class WristRecorder(GatedRecorder):
         # per-sensor and the stamps are only comparable to the scene camera's if it is
         # actually on.
         put(rs.option.global_time_enabled, 1)
+        # Every option is written: they persist on the device across sessions.
+        # Manual values go in before auto is switched on, so turning auto off
+        # later has something to return to.
         put(rs.option.enable_auto_exposure, 0)
-        put(rs.option.enable_auto_white_balance, 1 if self.auto_wb else 0)
+        put(rs.option.enable_auto_white_balance, 0)
+        put(rs.option.auto_exposure_priority, 0)    # auto exposure may never lower fps
         put(rs.option.frames_queue_size, self.queue_size)
-        out['exposure_us'] = put(rs.option.exposure, self.exposure_us)
+        self.exposure_us = round(self.exposure_us / self.unit) * self.unit
+        out['exposure_us'] = put(rs.option.exposure, self.exposure_us / self.unit) * self.unit
+        r = s.get_option_range(rs.option.gain)       # 248 is past the D455's 128
+        self.gain = float(np.clip(self.gain, r.min, r.max))
+        out['gain'] = put(rs.option.gain, self.gain)
         out['white_balance'] = put(rs.option.white_balance, self.wb_temp)
-        if self.gain is not None:
-            out['gain'] = put(rs.option.gain, self.gain)
+        put(rs.option.enable_auto_exposure, 1 if self.auto_exp else 0)
+        put(rs.option.enable_auto_white_balance, 1 if self.auto_wb else 0)
         out['global_time_enabled'] = s.get_option(rs.option.global_time_enabled)
         out['auto_exposure'] = s.get_option(rs.option.enable_auto_exposure)
         out['auto_white_balance'] = s.get_option(rs.option.enable_auto_white_balance)
@@ -653,21 +699,27 @@ class WristRecorder(GatedRecorder):
         # recoverable only with dev.hardware_reset(). A fixed tuple read once
         # makes that impossible by construction rather than by discipline.
         self.sensor = s
-        for name in WRIST_TUNABLE:
+        for name in self._tunable():
             opt = getattr(rs.option, name, None)
             if opt is None or not s.supports(opt):
                 continue
             r = s.get_option_range(opt)
-            self.ranges[name] = {'min': r.min, 'max': r.max,
-                                 'step': r.step, 'default': r.default}
-            self.wanted[name] = s.get_option(opt)
+            k = self.unit if name == 'exposure' else 1    # held in us
+            self.ranges[name] = {'min': r.min * k, 'max': r.max * k,
+                                 'step': r.step * k, 'default': r.default * k}
+            self.wanted[name] = s.get_option(opt) * k
         # what we just wrote, so the shadow starts truthful
         self.wanted['exposure'] = float(self.exposure_us)
+        self.wanted['gain'] = float(self.gain)
         self.wanted['white_balance'] = float(self.wb_temp)
         self.wanted['enable_auto_white_balance'] = 1.0 if self.auto_wb else 0.0
-        if self.gain is not None:
-            self.wanted['gain'] = float(self.gain)
+        if self.ae_offered:
+            self.wanted['enable_auto_exposure'] = 1.0 if self.auto_exp else 0.0
+        out['model'] = self.model
         return out
+
+    def _tunable(self):
+        return [n for n in WRIST_TUNABLE if n != 'enable_auto_exposure' or self.ae_offered]
 
     # ----------------------------------------------------------- live controls
     def controls(self):
@@ -686,8 +738,9 @@ class WristRecorder(GatedRecorder):
         if self.sensor is None:
             return {}
         auto_wb = bool(self.wanted.get('enable_auto_white_balance', 0))
+        auto_exp = bool(self.wanted.get('enable_auto_exposure', 0))
         out = {}
-        for name in WRIST_TUNABLE:
+        for name in self._tunable():
             if name not in self.ranges:
                 continue
             r = self.ranges[name]
@@ -698,29 +751,36 @@ class WristRecorder(GatedRecorder):
                  'value': int(self.wanted.get(name, r['default'])),
                  'inactive': False, 'adjustable': True}
             if name == 'exposure':
-                e['useful_max'] = WRIST_USEFUL_EXPOSURE_MAX
+                e['useful_max'] = self.spec['exposure_max_us']
+            if name in ('exposure', 'gain') and auto_exp:
+                # driven by auto exposure, which the camera does not report
+                e['adjustable'] = False
+                e['stale'] = True
             elif name == 'white_balance':
                 # driven by the camera, and the number we hold is not what it is
                 # actually using -- say so rather than showing a plausible lie
                 e['adjustable'] = not auto_wb
                 e['stale'] = auto_wb
             out[name] = e
-        # No auto exposure on this camera, deliberately. The UI reads this to know
-        # not to render a toggle; see WRIST_TUNABLE.
-        out['_auto_exposure'] = False
+        out['_auto_exposure'] = auto_exp
         out['_auto_wb'] = auto_wb
+        out['_model'] = self.model      # picks the UI's wrist schema
         return out
 
     def set(self, ctrl, value):
         """-> (ok, detail). Clamps, snaps to step, writes, updates the shadow."""
         if self.sensor is None:
             return False, 'wrist camera is not up yet'
-        if ctrl not in WRIST_TUNABLE or ctrl not in self.ranges:
+        if ctrl not in self._tunable() or ctrl not in self.ranges:
             return False, f'{ctrl} is not tunable on the wrist camera'
+        # writing exposure OR gain under auto exposure silently switches it off
+        # (measured on the D455: AE 1 -> 0 on a gain write), so refuse both
+        if ctrl in ('exposure', 'gain') and self.wanted.get('enable_auto_exposure'):
+            return False, 'auto exposure is on; switch it off to set this'
         r = self.ranges[ctrl]
         hi = r['max']
         if ctrl == 'exposure':
-            hi = min(hi, WRIST_USEFUL_EXPOSURE_MAX)
+            hi = min(hi, self.spec['exposure_max_us'])
         v = float(np.clip(float(value), r['min'], hi))
         # Snap to the step before writing. White balance steps by 10; an unsnapped
         # write is rounded by the driver and the readback then disagrees with the
@@ -730,8 +790,14 @@ class WristRecorder(GatedRecorder):
         v = float(np.clip(v, r['min'], hi))
         try:
             with self._opt_lock:
-                self.sensor.set_option(getattr(rs.option, ctrl), v)
+                self.sensor.set_option(getattr(rs.option, ctrl),
+                                       v / self.unit if ctrl == 'exposure' else v)
                 self.wanted[ctrl] = v
+                if ctrl == 'enable_auto_exposure' and not v:
+                    # back to manual: re-assert what the sliders show
+                    self.sensor.set_option(rs.option.exposure,
+                                           self.wanted['exposure'] / self.unit)
+                    self.sensor.set_option(rs.option.gain, self.wanted['gain'])
                 if ctrl == 'enable_auto_white_balance' and not v:
                     # Coming off auto, the device keeps reporting -- and using --
                     # something we cannot read. Re-assert the shadow so "off"
@@ -751,11 +817,13 @@ class WristRecorder(GatedRecorder):
         the footage was actually shot at.
         """
         auto_wb = bool(self.wanted.get('enable_auto_white_balance', 0))
+        auto_exp = bool(self.wanted.get('enable_auto_exposure', 0))
         self.settings.update({
-            'exposure_us': self.wanted.get('exposure'),
-            'gain': self.wanted.get('gain'),
+            # null under auto exposure: the camera does not report what it uses
+            'exposure_us': None if auto_exp else self.wanted.get('exposure'),
+            'gain': None if auto_exp else self.wanted.get('gain'),
             'auto_white_balance': 1.0 if auto_wb else 0.0,
-            'auto_exposure': 0.0,
+            'auto_exposure': 1.0 if auto_exp else 0.0,
             # Under auto WB the device will not tell us what it settled on, so
             # null is the honest answer -- see controls().
             'white_balance': None if auto_wb else self.wanted.get('white_balance'),
@@ -772,6 +840,7 @@ class WristRecorder(GatedRecorder):
         try:
             prof = pipe.start(cfg)
             self.settings = self._configure(prof)
+            self._sync_settings()
         except Exception as e:
             self.err = f'wrist start failed: {e}'
             log.exception('wrist camera failed to start')
@@ -1042,8 +1111,8 @@ class RecordSession:
 
     def __init__(self, out_root=None, scene=True, wrist=True,
                  scene_exposure=800, scene_wb=4600, scene_gamma=128,
-                 scene_gain=100, wrist_exposure_us=6000, wrist_gain=248,
-                 wrist_wb=4600, wrist_auto_wb=False):
+                 scene_gain=100, wrist_exposure_us=None, wrist_gain=None,
+                 wrist_wb=4600, wrist_auto_wb=True, wrist_auto_exposure=None):
         if not scene and not wrist:
             raise RecordError('nothing to record (both cameras disabled)')
         if wrist and rs is None:
@@ -1081,11 +1150,12 @@ class RecordSession:
             if wrist:
                 # configured inside the recorder, on its own started pipeline -- never
                 # through a second handle from query_devices(). See _configure().
-                self.recs['wrist'] = WristRecorder(*WRIST_SIZE, WRIST_FPS,
+                self.recs['wrist'] = WristRecorder(wrist_model(),
                                                    self.mono2epoch, ENCODER,
                                                    exposure_us=wrist_exposure_us,
                                                    gain=wrist_gain, wb_temp=wrist_wb,
-                                                   auto_wb=wrist_auto_wb)
+                                                   auto_wb=wrist_auto_wb,
+                                                   auto_exposure=wrist_auto_exposure)
             for r in self.recs.values():
                 r.start()
         except BaseException:
@@ -1351,10 +1421,10 @@ class RecordSession:
                        'focus_absolute': focus, 'zoom_absolute': zoom,
                        'controls': scene_ctrls,
                        'codec': 'mjpeg (passthrough, not re-encoded)'},
-             'wrist': dict(self.recs['wrist'].settings if 'wrist' in self.recs else {},
-                           size=list(WRIST_SIZE), fps=WRIST_FPS, encoder=ENCODER,
-                           timestamp_domains=sorted(self.recs['wrist'].domains)
-                           if 'wrist' in self.recs else []),
+             'wrist': dict(self.recs['wrist'].settings, size=list(self.recs['wrist'].size),
+                           fps=self.recs['wrist'].fps, encoder=ENCODER,
+                           timestamp_domains=sorted(self.recs['wrist'].domains))
+             if 'wrist' in self.recs else {'encoder': ENCODER},
              'gripper': {'device': GRIPPER_DEVICE, 'raw_open': GRIPPER_RAW_OPEN,
                          'max_width_m': GRIPPER_MAX_WIDTH,
                          'format': '<opening raw>_<force raw> per line',
@@ -1471,21 +1541,20 @@ def main():
                     help='0-1023, default 100. Weak above ~200 on this sensor: mean '
                          '2.0 at gain 0, 6.4 at gain 200, 6.5 at gain 1023. Pass -1 '
                          'to leave it alone.')
-    ap.add_argument('--wrist-exposure', type=int, default=6000, metavar='US',
-                    help='microseconds, default 6000. Raise this only after gain is '
-                         'maxed, since it is the axis that costs motion blur. Measured '
-                         'at gain 248: 5000 -> mean 75.8 (0%% clipped), 7500 -> 97.4 '
-                         '(0.15%%), 10000 -> 118.4 (2.2%%). Must stay under the frame '
-                         'period (11111 us at 90 fps) or the camera silently drops '
-                         'to 60 fps.')
-    ap.add_argument('--wrist-gain', type=int, default=248, metavar='G',
-                    help='16-248, default 248 (the maximum). The sensor floor is 16 and '
-                         'auto exposure never raises it, which is why the image was near '
-                         'black. Gain is the free axis here: no motion blur, no frame '
-                         'rate cost, and zero clipping even at the maximum. Measured at '
-                         '5 ms / 90 fps: gain 200 -> mean 61.9, 224 -> 70.0, 248 -> 75.8, '
-                         'all with 0.00%% of pixels saturated. If you need more than '
-                         'that, raise --wrist-exposure next, not gain.')
+    ap.add_argument('--wrist-exposure', type=int, default=None, metavar='US',
+                    help='microseconds; default per camera (6000). Raise it only after '
+                         'gain is maxed, since it is the axis that costs motion blur. '
+                         'Must stay under the cap in WRIST_MODELS (D405 10000, D455 '
+                         '10900) or the frame rate drops. Ignored under --wrist-ae 1.')
+    ap.add_argument('--wrist-gain', type=int, default=None, metavar='G',
+                    help='default per camera: D405 248 (its maximum, range 16-248; '
+                         'gain is the free axis there -- no blur, no frame-rate cost), '
+                         'D455 64 (range 0-128)')
+    ap.add_argument('--wrist-ae', type=int, choices=(0, 1), default=None,
+                    help='auto exposure, where the camera offers it (D455, on by '
+                         'default); the D405 has none')
+    ap.add_argument('--wrist-awb', type=int, choices=(0, 1), default=1,
+                    help='auto white balance, default on')
     ap.add_argument('--wrist-wb', type=int, default=4600, metavar='K')
     ap.add_argument('--no-display', action='store_true',
                     help='headless; episodes are driven from stdin (ENTER / q)')
@@ -1493,11 +1562,6 @@ def main():
     ap.add_argument('--no-wrist', action='store_true')
     args = ap.parse_args()
 
-    if not args.no_wrist and args.wrist_exposure >= 1e6 / WRIST_FPS:
-        print(f'  WARNING: exposure {args.wrist_exposure}us >= the '
-              f'{1e6/WRIST_FPS:.0f}us frame period at {WRIST_FPS} fps -- '
-              f'the camera will silently drop to a slower rate. Measured: 10000us '
-              f'holds 89.9 fps, 11000us gives 60.0, 20000us gives 30.0')
     try:
         sess = RecordSession(args.output,
                              scene=not args.no_scene, wrist=not args.no_wrist,
@@ -1505,9 +1569,16 @@ def main():
                              scene_wb=args.scene_wb, scene_gamma=args.scene_gamma,
                              scene_gain=args.scene_gain,
                              wrist_exposure_us=args.wrist_exposure,
-                             wrist_gain=args.wrist_gain, wrist_wb=args.wrist_wb)
+                             wrist_gain=args.wrist_gain, wrist_wb=args.wrist_wb,
+                             wrist_auto_wb=bool(args.wrist_awb),
+                             wrist_auto_exposure=None if args.wrist_ae is None
+                             else bool(args.wrist_ae))
     except RecordError as e:
         sys.exit(str(e))
+    wr = sess.recs.get('wrist')
+    if wr and args.wrist_exposure and args.wrist_exposure > wr.spec['exposure_max_us']:
+        print(f'  WARNING: exposure {args.wrist_exposure}us is past the {wr.model} cap of '
+              f'{wr.spec["exposure_max_us"]}us -- the frame rate will drop below {wr.fps}')
 
     session, recs = sess.dir, sess.recs
     print(f'session: {session}')
@@ -1516,12 +1587,12 @@ def main():
     print(f'clock: CLOCK_MONOTONIC + {sess.mono2epoch:.6f} s = CLOCK_REALTIME')
     if 'wrist' in recs:
         w = recs['wrist'].settings
-        gain = f'gain={w["gain"]:.0f} ' if w.get('gain') is not None else 'gain=unset '
-        # white_balance is None when auto WB is on -- the camera will not report
-        # the value it chose, so there is no number to print
+        # None under auto -- the camera will not report the value it chose
+        gain = f'gain={w["gain"]:.0f} ' if w.get('gain') is not None else 'gain=auto '
+        exp = f'{w["exposure_us"]:.0f}us' if w.get('exposure_us') is not None else 'auto'
         wb = f'{w["white_balance"]:.0f}K' if w.get('white_balance') is not None else 'auto'
-        print(f'  wrist locked: {w["name"]} sn={w["serial"]} '
-              f'exp={w["exposure_us"]:.0f}us {gain}'
+        print(f'  wrist: {w["name"]} sn={w["serial"]} {recs["wrist"].size[0]}x'
+              f'{recs["wrist"].size[1]}@{recs["wrist"].fps} exp={exp} {gain}'
               f'wb={wb} auto_exp={w["auto_exposure"]:.0f} '
               f'auto_wb={w["auto_white_balance"]:.0f} '
               f'global_time={w["global_time_enabled"]:.0f}')

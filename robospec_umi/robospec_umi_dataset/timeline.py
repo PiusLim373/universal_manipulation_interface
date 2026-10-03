@@ -15,15 +15,26 @@ DERIVED = 'derived'
 TCP_NPZ = 'scene_tcp.npz'
 
 # The TRACKED board on the gripper -- NOT the 7x5 30 mm calibration target.
-TRACK_BOARD = {'size': (4, 4), 'square': 0.020, 'marker': 0.015, 'dict': 'DICT_4X4_50'}
+TRACK_BOARD = {'size': (4, 4), 'square': 0.025, 'marker': 0.018, 'dict': 'DICT_4X4_50'}
 # Override for testing on other footage, e.g. "7x5,0.030,0.022,DICT_4X4_50".
 if os.environ.get('ROBOSPEC_TRACK_BOARD'):
     _s, _sq, _mk, _d = os.environ['ROBOSPEC_TRACK_BOARD'].split(',')
     TRACK_BOARD = {'size': tuple(int(v) for v in _s.split('x')),
                    'square': float(_sq), 'marker': float(_mk), 'dict': _d}
 
+# Training crop of the wrist frame: a full-height square from this left edge, then
+# resized to 224. The D455's colour camera sits off the gripper's centre line, so its
+# crop is shifted left to keep both fingers in at full opening. Other sizes centre.
+WRIST_CROP_X = {(640, 360): 106}
+
+
+def wrist_crop(w, h):
+    """-> (x0, size) of the square training crop for a w x h wrist frame."""
+    return WRIST_CROP_X.get((w, h), (w - h) // 2), h
+
+
 # Board centre -> TCP, then body-fixed turns. Fixed by how the board is mounted.
-TCP_OFFSET = (0.0, -0.200, 0.055)
+TCP_OFFSET = (0.0, -0.155, 0.0725)
 TCP_ROTATION = ('x', '180', 'z', '90')
 
 GRID_HZ = 60.0          # matches umi.yaml; the policy is trained at this rate

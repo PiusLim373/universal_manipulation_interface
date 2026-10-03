@@ -41,6 +41,7 @@ import time
 import uuid
 import zipfile
 
+import av
 import cv2
 import numpy as np
 import yaml
@@ -493,6 +494,10 @@ class CapturePreview:
                     continue
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 mean, clip, dark, _, verdict, _ = CS.exposure_stats(gray)
+                # the training crop, on the preview's own copy of the frame
+                h, w = img.shape[:2]
+                x0, side = TL.wrist_crop(w, h)
+                cv2.rectangle(img, (x0, 0), (x0 + side - 1, h - 1), (0, 255, 255), 1)
                 ok, buf = cv2.imencode('.jpg', img,
                                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 if ok:
@@ -1127,13 +1132,16 @@ async def capture_start(request):
         BROKER.acquire_all(devices, CAPTURE_KEY)
     except Busy as b:
         return json_err(409, str(b), owner=b.owner, device=b.device)
+    # wrist exposure / gain / auto exposure: the camera model's defaults unless set
+    opt = lambda k, f: None if body.get(k) is None else f(body[k])   # noqa: E731
     try:
         sess = await asyncio.to_thread(
             CAP.RecordSession, CAPTURE_ROOT, want_scene, want_wrist,
             int(body.get('scene_exposure', 800)), int(body.get('scene_wb', 4600)),
             int(body.get('scene_gamma', 128)), int(body.get('scene_gain', 100)),
-            int(body.get('wrist_exposure', 6000)), int(body.get('wrist_gain', 248)),
-            int(body.get('wrist_wb', 4600)), bool(body.get('wrist_auto_wb', False)))
+            opt('wrist_exposure', int), opt('wrist_gain', int),
+            int(body.get('wrist_wb', 4600)), bool(body.get('wrist_auto_wb', True)),
+            opt('wrist_auto_exposure', bool))
     except Exception as e:                           # noqa: BLE001
         BROKER.release_all(devices, CAPTURE_KEY, force=True)
         log_cap.exception('session failed to start')
@@ -1951,9 +1959,19 @@ def _timeline(d):
         'tcp': {'t': np.round(t[idx], 4).tolist(),
                 'xyz': _rows(xyz[idx]), 'rpy': _rows(rpy[idx])},
         'gripper': grip,
+        'wrist_crop': _wrist_crop(d),
         'duration_s': float(t[-1]), 'wrist_offset_s': meta['wrist_offset_s'],
         'wrist_duration_s': meta['wrist_duration_s'], 'meta': meta,
     }
+
+
+def _wrist_crop(d):
+    """The training crop as fractions of the wrist frame, for the edit overlay."""
+    with av.open(os.path.join(d, 'wrist', 'wrist.mkv')) as c:
+        st = c.streams.video[0]
+        w, h = st.width, st.height
+    x0, side = TL.wrist_crop(w, h)
+    return {'x0': x0, 'size': side, 'w': w, 'h': h}
 
 
 async def edit_timeline(request):

@@ -108,6 +108,12 @@ def scene_set(device, ctrl, value):
     """-> (ok, detail). Clamps against the cached range, then writes."""
     if ctrl not in TUNABLE:
         return False, f'{ctrl} is not tunable here'
+    # Under auto exposure a gain write is accepted but overridden, and kept for
+    # when auto goes off; an exposure write fails with a bare EACCES. Refuse both,
+    # as the wrist does.
+    if ctrl in ('gain', 'exposure_time_absolute') and \
+            CS.v4l2_controls(device).get('auto_exposure', {}).get('value') == 3:
+        return False, 'auto exposure is on; switch it off to set this'
     rng = _ranges(device).get(ctrl)
     if rng:
         value = int(np.clip(int(value), rng['min'], rng['max']))

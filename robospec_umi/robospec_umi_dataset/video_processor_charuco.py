@@ -616,7 +616,7 @@ def main():
     ap.add_argument('--dict', default='DICT_4X4_50', help='cv2.aruco dictionary name')
     ap.add_argument('--legacy-pattern', choices=['auto', 'yes', 'no'], default='auto',
                     help='black/white phase of the printed board (default: probe the video)')
-    ap.add_argument('--tcp-offset', type=float, nargs=3, default=[0.0, -0.200, 0.055],
+    ap.add_argument('--tcp-offset', type=float, nargs=3, default=[0.0, -0.155, 0.0725],
                     metavar=('X', 'Y', 'Z'), help='board centre -> TCP translation (m)')
     ap.add_argument('--tcp-rotation', nargs='*', default=['x', '180', 'z', '90'],
                     metavar='AXIS DEG', help='body-fixed turns applied after the translation')

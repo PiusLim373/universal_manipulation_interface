@@ -220,15 +220,20 @@ def build(items, output, intr_path, workers=PREP_WORKERS):
         compressor=JpegXl(level=COMPRESSION_LEVEL, numthreads=1),
         dtype=np.uint8)
 
-    tf = None
-    print(flush=True)
+    sizes = set()
+    for ep in kept:
+        with av.open(os.path.join(ep['dir'], 'wrist', 'wrist.mkv')) as c:
+            st = c.streams.video[0]
+            sizes.add((st.width, st.height))
+    if len(sizes) > 1:      # one crop per dataset, and the model learns one view
+        sys.exit(f'wrist frame sizes differ across episodes ({sorted(sizes)}); '
+                 'build D405 and D455 recordings into separate datasets')
+    (w, h), = sizes
+    x0, side = TL.wrist_crop(w, h)
+    tf = get_image_transform((w, h), out_res, crop_x=x0)
+    print(f'\nimage transform: {w}x{h} -> crop x {x0}-{x0 + side} -> '
+          f'{out_res[0]}x{out_res[1]}', flush=True)
     for ep, buf in zip(kept, starts):
-        if tf is None:
-            with av.open(os.path.join(ep['dir'], 'wrist', 'wrist.mkv')) as c:
-                st = c.streams.video[0]
-                tf = get_image_transform((st.width, st.height), out_res)
-                print(f'image transform: {st.width}x{st.height} -> centre crop -> '
-                      f'{out_res[0]}x{out_res[1]}', flush=True)
         n = fill_images(ep, img_array, buf, tf)
         print(f'  {ep["name"]}: {n}/{len(ep["grid"])} frames written', flush=True)
 
@@ -237,6 +242,8 @@ def build(items, output, intr_path, workers=PREP_WORKERS):
     tmp = output + '.tmp'
     with zarr.ZipStore(tmp, mode='w') as zs:
         rb.save_to_store(store=zs)
+        # what a robot-side deploy must reproduce; save_to_store drops root attrs
+        zarr.group(zs).attrs['wrist_crop'] = [int(x0), 0, int(side), int(side)]
     os.replace(tmp, output)
 
     size = os.path.getsize(output) / 1e6

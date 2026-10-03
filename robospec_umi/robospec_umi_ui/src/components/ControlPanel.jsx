@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Lightbulb, Info } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { SCHEMAS } from '@/lib/controlSchemas'
+import { SCHEMAS, WRIST_SCHEMAS } from '@/lib/controlSchemas'
 
 /**
  * Photometric sliders for one camera, driven by a schema.
@@ -89,7 +89,7 @@ function Toggle({ label, on, onChange, hint }) {
 export default function ControlPanel({ cam = 'scene', controls, onSet,
                                        mask, onMask, mean }) {
   if (!controls) return <p className="text-sm text-muted-foreground">reading camera…</p>
-  const schema = SCHEMAS[cam] || SCHEMAS.scene
+  const schema = (cam === 'wrist' && WRIST_SCHEMAS[controls._model]) || SCHEMAS[cam] || SCHEMAS.scene
   const autoExp = controls._auto_exposure
 
   // Out of road: still dark with both light-collecting controls at their

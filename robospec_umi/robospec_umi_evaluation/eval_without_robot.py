@@ -62,12 +62,14 @@ DATA = os.path.join(REPO, 'data')
 
 # The repo root carries diffusion_policy/ and umi/, which are not installed.
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(PKG, 'robospec_umi_dataset'))
 
 import dill                                                    # noqa: E402
 import hydra                                                   # noqa: E402
 from omegaconf import open_dict                                # noqa: E402
 from umi.common.cv_util import get_image_transform             # noqa: E402
 from umi.common.pose_util import pose10d_to_mat, mat_to_pose   # noqa: E402
+import timeline as TL                                          # noqa: E402
 
 # The 10-dim action for "do not move": zero translation, and the 6D rotation of
 # the identity matrix (its first two rows).
@@ -192,8 +194,9 @@ def decode_wrist(mkv, out_res):
     with av.open(mkv) as c:
         st = c.streams.video[0]
         st.thread_count = 4
-        tf = get_image_transform((st.width, st.height), (out_res, out_res))
-        src = f'{st.width}x{st.height}'
+        x0, side = TL.wrist_crop(st.width, st.height)
+        tf = get_image_transform((st.width, st.height), (out_res, out_res), crop_x=x0)
+        src = f'{st.width}x{st.height} crop x {x0}-{x0 + side}'
         for f in c.decode(st):
             frames.append(tf(f.to_ndarray(format='rgb24')))
     return np.array(frames), src
@@ -424,7 +427,7 @@ def main():
             res = cfg.task.shape_meta['obs']['camera0_rgb']['shape'][1]
             video, src = decode_wrist(mkv, res)
             print(f'video       {mkv}')
-            print(f'            {len(video)} frames, {src} -> centre crop -> '
+            print(f'            {len(video)} frames, {src} -> '
                   f'{res}x{res}')
             aligned = align_episode(video, dataset.replay_buffer)
             if not aligned:

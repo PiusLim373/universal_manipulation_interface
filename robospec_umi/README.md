@@ -311,13 +311,29 @@ In the web UI, **Capture** is two stages — *Preview & Lock*, then *Capture
 Dataset* — reached from the home page. One session owns both cameras across both
 stages: they open once when you enter Preview & Lock and stay open until you
 press Finish, so the 3 s warm-up is paid while you are tuning rather than again
-on the way into recording, and the D405's pipeline is started exactly once.
+on the way into recording, and the RealSense pipeline is started exactly once.
 
 Preview & Lock shows both cameras. The scene panel is the same one calibration
 uses (auto or manual exposure, white balance, gamma, gain) plus the geometry
-lock. The wrist panel is manual exposure and gain with an auto white balance
-toggle — the D405 has no usable auto exposure, for the reason printed on the
-panel. Controls are frozen for the duration of each episode.
+lock. Controls are frozen for the duration of each episode.
+
+The wrist camera is a RealSense **D455** or **D405**, detected at session start
+(`WRIST_MODELS` in `capture.py`):
+
+| | D455 | D405 |
+|---|---|---|
+| stream | 640×360 @ 90 fps | 848×480 @ 90 fps |
+| auto exposure | on by default, never lowers the frame rate | not offered (unusable on this camera) |
+| manual exposure cap | 10900 µs (11.0–11.1 ms gives black frames) | 10000 µs |
+| gain | 0–128, default 64 | 16–248, default 248 |
+
+Auto white balance is on by default for both. On the D455, exposure and gain are
+recorded as unknown while auto exposure is on, because the camera doesn't report
+them. The yellow box on the wrist stream, and on the Edit page's wrist video, is
+the training crop. On the D455 it is a full-height square from x = 106, shifted
+left so both fingers stay in view at full opening (`WRIST_CROP_X` in
+`timeline.py`, shared by `build_zarr.py` and `eval_without_robot.py`, and stored
+in the zarr as `wrist_crop`). Other frame sizes are centre-cropped.
 
 Or from the CLI:
 
@@ -401,7 +417,7 @@ longer than its video shifts every later frame by ~10 ms — about 1 cm of TCP
 label error, applied silently. It also re-checks focus and zoom against the
 calibration.
 
-`build_zarr.py` tracks the small 4×4 / 20 mm board, solves a TCP pose per frame,
+`build_zarr.py` tracks the small 4×4 board (25 mm squares, 18 mm markers), solves a TCP pose per frame,
 resamples onto a 60 Hz grid and pairs each grid point with the nearest wrist
 frame. Grid points are chosen **by time, never by frame index** — the wrist drops
 frames in bursts, so striding every Nth frame stops being uniform the moment one

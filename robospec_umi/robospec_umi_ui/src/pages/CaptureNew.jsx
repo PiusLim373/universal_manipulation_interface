@@ -88,6 +88,7 @@ function RecordStage({ onFinished }) {
   const [loadErr, setLoadErr] = useState(null)
   const [reloads, setReloads] = useState(0)
   const unsubRef = useRef(null)
+  const epList = useRef(null)
   const nav = useNavigate()
 
   // Never swallow this. When it failed silently the page sat on "connecting…"
@@ -118,6 +119,13 @@ function RecordStage({ onFinished }) {
   }, [state, pending])
 
   useHotkeys({ ' ': toggle, Enter: toggle })
+
+  // keep the newest episode in view as the list grows
+  const nEps = state?.episodes?.length ?? 0
+  useEffect(() => {
+    const el = epList.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [nEps])
 
   const finish = async () => {
     setPending(true)
@@ -208,7 +216,7 @@ function RecordStage({ onFinished }) {
       </div>
 
       <div className="flex flex-col gap-4 min-h-0 overflow-auto">
-        <Card className="mt-auto"><CardContent className="pt-6 space-y-3">
+        <Card className="mt-auto shrink-0"><CardContent className="pt-6 space-y-3">
           <Status s={s} />
           <Button className="w-full" onClick={(e) => { e.currentTarget.blur(); toggle() }}
                   variant={s?.recording ? 'destructive' : 'default'}
@@ -221,7 +229,7 @@ function RecordStage({ onFinished }) {
           </p>
         </CardContent></Card>
 
-        <Card><CardContent className="pt-6 space-y-2">
+        <Card className="shrink-0"><CardContent className="pt-6 space-y-2">
           <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
             saving to
           </p>
@@ -238,14 +246,16 @@ function RecordStage({ onFinished }) {
           </div>
         </CardContent></Card>
 
-        <Card><CardContent className="pt-6 space-y-2">
-          <div className="flex items-baseline justify-between">
+        {/* the only card that shrinks: its list scrolls, so Finish stays on screen */}
+        <Card className="min-h-0"><CardContent className="pt-6 flex flex-col gap-2 min-h-0">
+          <div className="flex items-baseline justify-between shrink-0">
             <span className="text-2xl font-heading tabular-nums">{eps.length}</span>
             <span className="text-xs text-muted-foreground">episodes recorded</span>
           </div>
           {eps.length === 0 && (
             <p className="text-xs text-muted-foreground">nothing recorded yet</p>
           )}
+          <div ref={epList} className="min-h-0 overflow-y-auto space-y-2 -mr-2 pr-2">
           {eps.map((e) => (
             <div key={e.index} className="text-[11px] border-t border-border/40 pt-1.5">
               <div className="flex items-baseline justify-between">
@@ -267,9 +277,10 @@ function RecordStage({ onFinished }) {
               </div>
             </div>
           ))}
+          </div>
         </CardContent></Card>
 
-        <Card><CardContent className="pt-6 space-y-3">
+        <Card className="shrink-0"><CardContent className="pt-6 space-y-3">
           <p className="text-xs text-muted-foreground">
             Finishing writes session.json and releases both cameras. Reviewing,
             verifying and compiling the dataset happen in Edit.

@@ -413,14 +413,16 @@ def inpaint_tag(img, corners, tag_scale=1.4, n_samples=16):
     return img
 
 # =========== other utils ====================
-def get_image_transform(in_res, out_res, crop_ratio:float = 1.0, bgr_to_rgb: bool=False):
+def get_image_transform(in_res, out_res, crop_ratio:float = 1.0, bgr_to_rgb: bool=False,
+                        crop_x=None):
+    # crop_x: the crop's left edge; None centres it
     iw, ih = in_res
     ow, oh = out_res
     ch = round(ih * crop_ratio)
     cw = round(ih * crop_ratio / oh * ow)
     interp_method = cv2.INTER_AREA
 
-    w_slice_start = (iw - cw) // 2
+    w_slice_start = (iw - cw) // 2 if crop_x is None else crop_x
     w_slice = slice(w_slice_start, w_slice_start + cw)
     h_slice_start = (ih - ch) // 2
     h_slice = slice(h_slice_start, h_slice_start + ch)

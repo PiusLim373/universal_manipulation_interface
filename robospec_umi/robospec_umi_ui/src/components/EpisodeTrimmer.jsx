@@ -448,6 +448,15 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
                 <video key={`w-${current}`} ref={wristRef} muted playsInline preload="auto"
                        src={api.media(current, 'wrist.mp4', prepAt)}
                        className="w-full h-full object-contain" />
+                {/* the training crop; 'meet' scales it exactly like object-contain */}
+                {tl.wrist_crop && (
+                  <svg className="absolute inset-0 w-full h-full pointer-events-none"
+                       viewBox={`0 0 ${tl.wrist_crop.w} ${tl.wrist_crop.h}`}
+                       preserveAspectRatio="xMidYMid meet">
+                    <rect x={tl.wrist_crop.x0} y={0} width={tl.wrist_crop.size} height={tl.wrist_crop.h}
+                          fill="none" stroke="#facc15" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+                  </svg>
+                )}
               </div>
               <TcpGraph tcp={tl.tcp} duration={tl.duration_s} time={time} trim={trim} />
               <GripperGraph gripper={tl.gripper} duration={tl.duration_s} time={time} trim={trim} />
