@@ -8,7 +8,7 @@ Point it at a folder holding one .mp4 and it writes back into that folder:
 
 Pipeline:
   1. detect the board in every frame (cached): ArUco markers first, then the
-     chessboard corners interpolated between them
+     chessboard corners interpolated between them and re-refined (refine_corners)
   2. solve one board pose per frame from every visible chessboard corner at once
   3. move the origin from the board's corner to the board centre
   4. apply the fixed centre->TCP transform (translation, then body-fixed rotations)
@@ -212,6 +212,24 @@ def board_centre(chess):
 
 
 # ------------------------------------------------------------------ detection
+SUBPIX_CRIT = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
+
+
+def refine_corners(gray, markers, cc, ci, ratio):
+    """cornerSubPix with a window a quarter of the apparent square (4-12 px).
+
+    OpenCV's own window collapses with the board far away, and the jittering
+    corners flip the planar pose. ratio = square / marker length.
+    """
+    if cc is None or not markers:
+        return markers, cc, ci
+    side = np.median([np.linalg.norm(m[0] - m[2]) for m in markers.values()]) / np.sqrt(2)
+    w = int(np.clip(side * ratio / 4, 4, 12))
+    cc = cv2.cornerSubPix(gray, cc.astype(np.float32).reshape(-1, 1, 2), (w, w), (-1, -1),
+                          SUBPIX_CRIT)
+    return markers, cc.reshape(-1, 2).astype(np.float64), ci
+
+
 def make_detector(board):
     """Return detect(gray) -> (markers {id: (4,2)}, charuco corners (N,2), ids (N,)).
 
@@ -230,6 +248,7 @@ def make_detector(board):
     params.adaptiveThreshWinSizeStep = 8
     params.minMarkerPerimeterRate = 0.01
     params.polygonalApproxAccuracyRate = 0.05
+    ratio = board.getSquareLength() / board.getMarkerLength()
 
     def pack(mc, mi, cc, ci):
         markers = {}
@@ -248,7 +267,7 @@ def make_detector(board):
 
         def detect(gray):
             cc, ci, mc, mi = detector.detectBoard(gray)
-            return pack(mc, mi, cc, ci)
+            return refine_corners(gray, *pack(mc, mi, cc, ci), ratio)
         return detect
 
     adict = board.dictionary
@@ -258,7 +277,7 @@ def make_detector(board):
         if mi is None or len(mi) == 0:
             return {}, None, None
         _, cc, ci = cv2.aruco.interpolateCornersCharuco(mc, mi, gray, board)
-        return pack(mc, mi, cc, ci)
+        return refine_corners(gray, *pack(mc, mi, cc, ci), ratio)
     return detect
 
 
