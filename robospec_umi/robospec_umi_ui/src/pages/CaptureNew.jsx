@@ -3,6 +3,7 @@ import { Navigate, useNavigate, useParams, Link } from 'react-router-dom'
 import { Eye, Video, Check, Circle, Square, Loader2, AlertTriangle, Copy } from 'lucide-react'
 import Page from '@/components/Page'
 import CameraStream from '@/components/CameraStream'
+import GripperReadout from '@/components/GripperReadout'
 import CameraBusy from '@/components/CameraBusy'
 import PreviewLock from '@/components/PreviewLock'
 import Stepper from '@/components/Stepper'
@@ -197,6 +198,7 @@ function RecordStage({ onFinished }) {
             </div>
           ))}
         </div>
+        <GripperReadout g={s?.gripper} recording={s?.recording} />
         {err && <p className="text-sm text-destructive shrink-0">{err}</p>}
         {camErr.map((m) => (
           <p key={m} className="text-sm text-destructive shrink-0 flex items-center gap-1.5">
@@ -261,6 +263,7 @@ function RecordStage({ onFinished }) {
                     )}
                   </span>
                 ))}
+                {e.gripper && <span>gripper {e.gripper.samples} @ {e.gripper.hz.toFixed(1)}</span>}
               </div>
             </div>
           ))}
@@ -324,7 +327,8 @@ export default function CaptureNew() {
         // AWAIT the refresh before navigating. Firing it and calling nav() in
         // the same tick means the guard above re-runs against the stale
         // progress, sees active:false, and redirects straight back here.
-        <PreviewLock endpoints={CAPTURE_PREVIEW} onDone={async () => {
+        <PreviewLock endpoints={CAPTURE_PREVIEW} aside={(st) => <GripperReadout g={st?.gripper} />}
+                     onDone={async () => {
           try {
             setProgress(await api.captureInfo())
           } catch (e) {

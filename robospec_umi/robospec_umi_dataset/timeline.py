@@ -33,7 +33,7 @@ MAX_FRAME_DIST = 0.012  # s -- ~one dropped wrist frame (11.1 ms period)
 MAX_SPIKE = 0.020       # m -- per-frame jump treated as a depth-ambiguity flip
 MAX_POSE_GAP = 0.0625   # s -- pose-track hole wider than this invalidates
 DELTA = 0.0             # extra latency to shift the wrist stream by
-GRIPPER_WIDTH = 0.0     # m -- no gripper-width signal on this rig yet
+MAX_GRIPPER_GAP = 0.1   # s -- gripper-sensor hole wider than this invalidates
 
 # per scene frame, stored in scene_tcp.npz
 OK, LOST, SPIKE, OUTSIDE, POSE_GAP, NO_WRIST = range(6)
@@ -169,13 +169,18 @@ def wrist_times(ep_dir):
 
 
 def gripper_track(ep_dir):
-    """-> (t_s, width_m): the gripper opening over the episode, on its own clock.
-
-    The one place the gripper signal comes from: the edit UI plots it and export
-    resamples it, so wiring the real sensor here updates both. Constant for now.
+    """-> (t_s, width_m) of the recorded opening, or None if the episode has no
+    gripper recording. The one place the signal comes from: the edit UI plots it
+    and export resamples it. Converted with the mapping saved beside the samples.
     """
-    t = np.load(os.path.join(ep_dir, 'scene', 'scene_ts.npz'))['t_ns'] / 1e9
-    return t, np.full(len(t), GRIPPER_WIDTH)
+    p = os.path.join(ep_dir, 'gripper', 'gripper_ts.npz')
+    if not os.path.exists(p):
+        return None
+    z = np.load(p)
+    if len(z['t_ns']) < 2:
+        return None
+    w = np.clip(z['raw'] / float(z['raw_open']), 0.0, 1.0) * float(z['max_width_m'])
+    return z['t_ns'].astype(np.float64) / 1e9, w
 
 
 def gripper_on_grid(ep_dir, grid):
@@ -204,6 +209,9 @@ def plan_episode(ep_dir, trim=None, with_poses=True, track=None):
     tr = track or load_track(ep_dir)
     t0 = tr['t_ns'][0] / 1e9
     out = {'segments': [], 'spans': [], 'usable': 0.0, 'grid_n': 0, 'kept_s': 0.0}
+    grip = gripper_track(ep_dir)
+    if grip is None:
+        return {**out, 'note': 'no gripper recording', 'reason': 'no gripper recording'}
     good = np.nonzero(tr['tracked'])[0]
     if len(good) < 2:
         return {**out, 'note': 'no tracked poses', 'reason': 'no tracked poses'}
@@ -222,13 +230,19 @@ def plan_episode(ep_dir, trim=None, with_poses=True, track=None):
     if len(grid) == 0:
         why = 'no temporal overlap between the two cameras'
         return {**out, 'note': why, 'reason': why}
-    valid = gap_ok & near_ok
+    # like a pose gap: a point is only as good as the two openings around it
+    gt = grip[0]
+    j = np.clip(np.searchsorted(gt, grid), 1, len(gt) - 1)
+    grip_ok = (grid >= gt[0]) & (grid <= gt[-1]) & (gt[j] - gt[j - 1] <= MAX_GRIPPER_GAP)
+    valid = gap_ok & near_ok & grip_ok
 
     segs = segments(valid, int(round(MIN_SEGMENT * GRID_HZ)))
     kept = sum(e - s for s, e in segs)
+    n_grip = int((~grip_ok).sum())
     note = (f'tracked {n_tracked/len(tr["t_ns"]):.1%} '
             f'({n_spike} spike{"" if n_spike == 1 else "s"} dropped), grid {len(grid)}, '
-            f'valid {valid.mean():.1%}, {len(segs)} segment(s), '
+            + (f'{n_grip} without a gripper reading, ' if n_grip else '')
+            + f'valid {valid.mean():.1%}, {len(segs)} segment(s), '
             f'kept {kept}/{len(grid)} = {kept/len(grid):.1%}')
     out.update(usable=float(valid.mean()), grid_n=int(len(grid)), kept_s=kept / GRID_HZ,
                spans=[(float(grid[s] - t0), float(grid[e - 1] - t0)) for s, e in segs])

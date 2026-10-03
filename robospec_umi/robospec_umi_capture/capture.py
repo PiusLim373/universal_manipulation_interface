@@ -108,6 +108,10 @@ try:
     import pyrealsense2 as rs
 except ImportError:
     rs = None
+try:
+    import serial
+except ImportError:
+    serial = None
 
 # Errors in the capture/write threads used to latch into `self.err` and be read
 # by nobody, so a camera dying mid-session showed up only as a frame counter that
@@ -157,6 +161,18 @@ WRIST_TUNABLE = ('exposure', 'gain', 'white_balance',
 # it silently renegotiates to a slower divisor of 90, which is why nothing
 # downstream notices. Stop the slider before the cliff.
 WRIST_USEFUL_EXPOSURE_MAX = 10000
+
+# Arduino on the gripper (arduino/UMI_Force_Angle.ino): '<opening>_<force>' lines at
+# ~40 Hz. The opening is a pot reading, linear in finger gap from 0 (closed) to
+# GRIPPER_RAW_OPEN at GRIPPER_MAX_WIDTH. See robospec_umi/99-gripper-sensor.rules.
+GRIPPER_DEVICE = '/dev/gripper_sensor'
+GRIPPER_BAUD = 115200
+GRIPPER_RAW_OPEN = 1146
+GRIPPER_MAX_WIDTH = 0.115   # m
+GRIPPER_STALE = 0.5         # s without a line before the UI calls it stalled
+GRIPPER_TRACE_S = 5.0       # s of opening history in the UI trace
+GRIPPER_TRACE_HZ = 10.0     # its sample rate, as the wrist preview: idle
+GRIPPER_TRACE_REC_HZ = 4.0  # and while recording
 
 # Seconds of streaming before the first episode may start, so the startup burst
 # and colour settling land in the bin rather than in episode 0.
@@ -878,6 +894,132 @@ class WristRecorder(GatedRecorder):
         return len(a), frame_rate(a[:, 0])
 
 
+# ------------------------------------------------------------------- gripper
+class GripperRecorder:
+    """The gripper sensor as one more stream: each line stamped on arrival with
+    CLOCK_MONOTONIC, the clock both cameras use, and kept only while armed.
+
+    Not a GatedRecorder: 40 lines a second need no writer thread. Reads block in
+    read(1), which releases the GIL; pyserial's readline() would instead take
+    it once per byte, ~500 times a second, next to the wrist's 11.1 ms deadline.
+    """
+
+    def __init__(self, device=None):
+        self.device = device or GRIPPER_DEVICE
+        # opened here so a missing or busy device fails the session up front
+        self.port = serial.Serial(self.device, GRIPPER_BAUD, timeout=0.2, exclusive=True)
+        self.err, self.live, self.written, self.bad, self.late = None, 0, 0, 0, 0
+        self.late_at_arm = 0
+        self.armed, self.out_dir, self.rows = False, None, []
+        self.latest = None                        # (t_ns, raw, force_raw)
+        self.recent = deque(maxlen=int(GRIPPER_TRACE_S * 2 * 50))
+        self.meter = RateMeter()
+        self.checkpoint = 40                      # ~1 s, like the camera sidecars
+        self.lock = threading.Lock()
+        self.stop_evt = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+        self.port.close()
+
+    def _read(self):
+        buf = b''
+        try:
+            self.port.reset_input_buffer()
+            while not self.stop_evt.is_set():
+                first = self.port.read(1)
+                if not first:
+                    continue
+                t = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+                buf += first + self.port.read(self.port.in_waiting)
+                *lines, buf = buf.split(b'\n')
+                rows = []
+                for ln in lines:
+                    try:
+                        raw, force = (int(x) for x in ln.split(b'_'))
+                    except ValueError:
+                        self.bad += 1          # the partial first line, or noise
+                        continue
+                    rows.append((t, raw, force))
+                if not rows:
+                    continue
+                # several lines in one read queued while this thread was held up;
+                # only the newest one's stamp is true, so the rest are dropped
+                self.late += len(rows) - 1
+                row = rows[-1]
+                self.latest = row
+                self.recent.append(row)
+                self.live += 1
+                self.meter.tick(t / 1e9)
+                with self.lock:
+                    if self.armed:
+                        self.rows.append(row)
+                        self.written += 1
+                        if self.written % self.checkpoint == 0:
+                            self._write()
+        except (serial.SerialException, OSError) as e:
+            self.err = f'{self.device}: {e}'
+            log.error('gripper: %s', self.err)
+
+    def prepare(self, out_dir):
+        pass
+
+    def arm(self, out_dir):
+        with self.lock:
+            self.out_dir, self.rows, self.written = out_dir, [], 0
+            self.late_at_arm = self.late
+            self.armed = True
+
+    def disarm(self):
+        with self.lock:
+            self.armed = False
+
+    def _write(self):
+        a = np.array(self.rows, dtype=np.int64).reshape(-1, 3)
+        np.savez(os.path.join(self.out_dir, 'gripper_ts.npz'),
+                 t_ns=a[:, 0], raw=a[:, 1].astype(np.int16),
+                 force_raw=a[:, 2].astype(np.int32),
+                 raw_open=GRIPPER_RAW_OPEN, max_width_m=GRIPPER_MAX_WIDTH)
+        return a
+
+    def save(self):
+        with self.lock:
+            if self.out_dir is None:
+                return 0, 0.0
+            a = self._write()
+        return len(a), frame_rate(a[:, 0])
+
+    @staticmethod
+    def width(raw):
+        return min(max(raw / GRIPPER_RAW_OPEN, 0.0), 1.0) * GRIPPER_MAX_WIDTH
+
+    def state(self, trace_hz):
+        """Latest reading plus the last GRIPPER_TRACE_S of width (mm), decimated
+        to trace_hz so the UI refresh costs what a camera preview does."""
+        last, now = self.latest, time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        trace, due = [], now - GRIPPER_TRACE_S * 1e9
+        for t, raw, _ in list(self.recent):
+            if t >= due:
+                trace.append(round(self.width(raw) * 1000, 1))
+                due = t + 1e9 / trace_hz
+        return {
+            'width_m': None if last is None else round(self.width(last[1]), 4),
+            'raw': None if last is None else last[1],
+            'force_raw': None if last is None else last[2],
+            'hz': round(self.meter.fps(), 1),
+            'age_s': None if last is None else round((now - last[0]) / 1e9, 2),
+            'stale_s': GRIPPER_STALE, 'max_width_m': GRIPPER_MAX_WIDTH,
+            'written': self.written, 'late': self.late, 'armed': self.armed, 'error': self.err,
+            'trace_hz': trace_hz, 'trace': trace,
+        }
+
+
 # ------------------------------------------------------------------- session
 class RecordError(RuntimeError):
     """A refusal or a hardware failure. Raised rather than sys.exit so a server
@@ -906,36 +1048,49 @@ class RecordSession:
             raise RecordError('nothing to record (both cameras disabled)')
         if wrist and rs is None:
             raise RecordError('pyrealsense2 is not installed')
+        if serial is None:
+            raise RecordError('pyserial is not installed')
+        # opened first: a missing gripper fails in milliseconds, not after the
+        # cameras have spun up
+        try:
+            self.gripper = GripperRecorder()
+        except (serial.SerialException, OSError) as e:
+            raise RecordError(f'gripper sensor {GRIPPER_DEVICE}: {e}') from None
 
-        self.stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.dir = os.path.join(os.path.abspath(out_root or os.path.join(DATA, 'capture')),
-                                self.stamp)
-        os.makedirs(self.dir, exist_ok=True)
-        self.mono2epoch = mono_to_epoch_offset()
-
-        self.scene_ctrls = ''
-        self.scene_args = {'exposure': scene_exposure, 'wb': scene_wb,
-                           'gamma': scene_gamma, 'gain': scene_gain}
-        if scene:
-            self.scene_ctrls = set_scene_controls(
-                SCENE_DEVICE, scene_exposure, scene_wb, scene_gamma,
-                None if scene_gain < 0 else scene_gain)
-
-        # insertion order is load-bearing: it drives the order cameras appear in
-        # the saved-episode line and in session.json
+        self.gripper.start()
         self.recs = {}
-        if scene:
-            self.recs['scene'] = SceneRecorder(SCENE_DEVICE, *SCENE_SIZE, SCENE_FPS)
-        if wrist:
-            # configured inside the recorder, on its own started pipeline -- never
-            # through a second handle from query_devices(). See _configure().
-            self.recs['wrist'] = WristRecorder(*WRIST_SIZE, WRIST_FPS,
-                                               self.mono2epoch, ENCODER,
-                                               exposure_us=wrist_exposure_us,
-                                               gain=wrist_gain, wb_temp=wrist_wb,
-                                               auto_wb=wrist_auto_wb)
-        for r in self.recs.values():
-            r.start()
+        try:
+            self.stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.dir = os.path.join(os.path.abspath(out_root or os.path.join(DATA, 'capture')),
+                                    self.stamp)
+            os.makedirs(self.dir, exist_ok=True)
+            self.mono2epoch = mono_to_epoch_offset()
+
+            self.scene_ctrls = ''
+            self.scene_args = {'exposure': scene_exposure, 'wb': scene_wb,
+                               'gamma': scene_gamma, 'gain': scene_gain}
+            if scene:
+                self.scene_ctrls = set_scene_controls(
+                    SCENE_DEVICE, scene_exposure, scene_wb, scene_gamma,
+                    None if scene_gain < 0 else scene_gain)
+
+            # insertion order is load-bearing: it drives the order cameras appear in
+            # the saved-episode line and in session.json
+            if scene:
+                self.recs['scene'] = SceneRecorder(SCENE_DEVICE, *SCENE_SIZE, SCENE_FPS)
+            if wrist:
+                # configured inside the recorder, on its own started pipeline -- never
+                # through a second handle from query_devices(). See _configure().
+                self.recs['wrist'] = WristRecorder(*WRIST_SIZE, WRIST_FPS,
+                                                   self.mono2epoch, ENCODER,
+                                                   exposure_us=wrist_exposure_us,
+                                                   gain=wrist_gain, wb_temp=wrist_wb,
+                                                   auto_wb=wrist_auto_wb)
+            for r in self.recs.values():
+                r.start()
+        except BaseException:
+            self.close_cameras()     # releases the gripper port too
+            raise
 
         self.episodes, self.ep_i = [], 0
         self.recording, self.t_ep = False, None
@@ -969,14 +1124,16 @@ class RecordSession:
         """
         t0 = time.time()
         while time.time() - t0 < timeout:
-            for k, r in self.recs.items():
+            for k, r in [*self.recs.items(), ('gripper', self.gripper)]:
                 if r.err:
                     raise RecordError(f'{k}: {r.err}')
-            if all(r.live > 0 for r in self.recs.values()) and (
+            if all(r.live > 0 for r in self.recs.values()) and self.gripper.live > 0 and (
                     'wrist' not in self.recs or self.recs['wrist'].settings):
                 return
             time.sleep(0.05)
         dead = [k for k, r in self.recs.items() if r.live == 0]
+        if self.gripper.live == 0:
+            dead.append(f'gripper (no lines from {GRIPPER_DEVICE}; is the sketch running?)')
         raise RecordError(f'camera(s) delivered no frames within {timeout:.0f}s: '
                           + ', '.join(dead or ['(settings never arrived)']))
 
@@ -1031,6 +1188,9 @@ class RecordSession:
                             'live': r.live, 'queue_drops': r.dropped,
                             'armed': r.armed, 'error': r.err}
                         for k, r in self.recs.items()},
+            # trace rate follows the wrist preview: 10 Hz idle, 4 Hz recording
+            'gripper': self.gripper.state(GRIPPER_TRACE_REC_HZ if self.recording
+                                          else GRIPPER_TRACE_HZ),
         }
 
     # --------------------------------------------------------------- controls
@@ -1066,6 +1226,7 @@ class RecordSession:
         for k, r in self.recs.items():
             os.makedirs(self.ep_dir(i, k), exist_ok=True)
             r.prepare(self.ep_dir(i, k))
+        os.makedirs(self.ep_dir(i, 'gripper'), exist_ok=True)
         self._prepared.add(i)
 
     def start_episode(self):
@@ -1080,11 +1241,12 @@ class RecordSession:
             self.transition = 'arming'
             i = self.ep_i
             try:
-                for k in self.recs:
+                for k in [*self.recs, 'gripper']:
                     os.makedirs(self.ep_dir(i, k), exist_ok=True)
-                # scene leads so every wrist frame is bracketed by scene poses.
-                # Shortening or inverting this leaves the episode's edge frames
-                # unlabelled -- see LEAD.
+                # scene and gripper lead so every wrist frame is bracketed by
+                # poses and openings. Shortening or inverting this leaves the
+                # episode's edge frames unlabelled -- see LEAD.
+                self.gripper.arm(self.ep_dir(i, 'gripper'))
                 if 'scene' in self.recs:
                     self.recs['scene'].arm(self.ep_dir(i, 'scene'))
                     time.sleep(LEAD)
@@ -1109,6 +1271,7 @@ class RecordSession:
                     time.sleep(LEAD)
                 if 'scene' in self.recs:
                     self.recs['scene'].disarm()
+                self.gripper.disarm()
                 # Not padding: save() reads the row lists from THIS thread while
                 # the writer thread may still be draining its queue toward DISARM.
                 time.sleep(0.4)
@@ -1117,6 +1280,9 @@ class RecordSession:
                 for k, r in self.recs.items():
                     n, fps = r.save()
                     ep[k] = {'frames': n, 'fps': fps, 'queue_drops': r.dropped}
+                n, hz = self.gripper.save()
+                ep['gripper'] = {'samples': n, 'hz': hz, 'bad': self.gripper.bad,
+                                 'late': self.gripper.late - self.gripper.late_at_arm}
                 self.episodes.append(ep)
                 self.recording = False
                 self.ep_i = i + 1
@@ -1127,7 +1293,7 @@ class RecordSession:
 
     # -------------------------------------------------------------- teardown
     def close_cameras(self):
-        for r in self.recs.values():
+        for r in [*self.recs.values(), self.gripper]:
             try:
                 r.stop()
             except Exception:                        # noqa: BLE001
@@ -1189,8 +1355,12 @@ class RecordSession:
                            size=list(WRIST_SIZE), fps=WRIST_FPS, encoder=ENCODER,
                            timestamp_domains=sorted(self.recs['wrist'].domains)
                            if 'wrist' in self.recs else []),
+             'gripper': {'device': GRIPPER_DEVICE, 'raw_open': GRIPPER_RAW_OPEN,
+                         'max_width_m': GRIPPER_MAX_WIDTH,
+                         'format': '<opening raw>_<force raw> per line',
+                         'bad_lines': self.gripper.bad, 'late_lines': self.gripper.late},
              'episodes': self.episodes}
-        for k, r in self.recs.items():
+        for k, r in [*self.recs.items(), ('gripper', self.gripper)]:
             if r.err:
                 m[k]['error'] = r.err
         return m
@@ -1240,7 +1410,7 @@ def pane(img, h, title, sub):
     return p
 
 
-def compose(panes, recording, ep_i, n_eps, elapsed, warm, skipped, disp_fps):
+def compose(panes, recording, ep_i, n_eps, elapsed, warm, skipped, disp_fps, grip=''):
     body = np.hstack(panes) if panes else np.full((240, 640, 3), 28, np.uint8)
     W = body.shape[1]
     bar = np.full((78, W, 3), 24, np.uint8)
@@ -1261,6 +1431,7 @@ def compose(panes, recording, ep_i, n_eps, elapsed, warm, skipped, disp_fps):
 
     right = f'episodes saved: {n_eps}'
     label(bar, right, (W - 250, 30), GREEN if n_eps else (150, 150, 150), 0.62, 2)
+    label(bar, grip, (W - 700, 30), (200, 200, 200), 0.55, 1)
     label(bar, f'preview {disp_fps:.0f} fps, {skipped} frames skipped (by design)',
           (W - 430, 60), (140, 140, 140), 0.45, 1)
 
@@ -1340,6 +1511,8 @@ def main():
 
     session, recs = sess.dir, sess.recs
     print(f'session: {session}')
+    print(f'  gripper: {GRIPPER_DEVICE}, raw 0..{GRIPPER_RAW_OPEN} = '
+          f'0..{GRIPPER_MAX_WIDTH * 1000:.0f} mm')
     print(f'clock: CLOCK_MONOTONIC + {sess.mono2epoch:.6f} s = CLOCK_REALTIME')
     if 'wrist' in recs:
         w = recs['wrist'].settings
@@ -1418,7 +1591,14 @@ def main():
         return compose(panes, sess.recording, sess.ep_i, len(sess.episodes),
                        (mono() - sess.t_ep) if sess.recording else 0.0, warm,
                        sum(r.preview.skipped for r in recs.values()),
-                       disp_meter.fps())
+                       disp_meter.fps(), grip_text())
+
+    def grip_text():
+        g = sess.gripper
+        if g.err:
+            return f'gripper ERROR {g.err}'
+        w = g.width(g.latest[1]) * 1000 if g.latest else float('nan')
+        return f'gripper {w:5.1f} mm  {g.meter.fps():4.1f} Hz'
 
     def start_ep():
         print(f'\n>>> ep{sess.start_episode():03d} recording')
@@ -1429,6 +1609,7 @@ def main():
             return
         print('\n<<< ep%03d saved: ' % i + '  '.join(
             f'{k} {ep[k]["frames"]} frames @ {ep[k]["fps"]:.1f} fps' for k in recs)
+            + f'  gripper {ep["gripper"]["samples"]} @ {ep["gripper"]["hz"]:.1f} Hz'
             + f'  ({ep["duration_s"]:.1f}s)')
 
     try:
@@ -1452,7 +1633,7 @@ def main():
             if not show and sess.recording and key is None:
                 print('\r  REC ep%03d  ' % sess.ep_i + '  '.join(
                     f'{k} {r.written}' for k, r in recs.items())
-                    + f'  |  {mono()-sess.t_ep:5.1f}s', end='', flush=True)
+                    + f'  |  {grip_text()}  |  {mono()-sess.t_ep:5.1f}s', end='', flush=True)
 
             if key is None:
                 continue
@@ -1477,7 +1658,7 @@ def main():
         'frames_skipped': {k: r.preview.skipped for k, r in recs.items()},
         'note': 'preview samples the stream; skipping is by design '
                 'and does not affect recorded files'})
-    for k in recs:
+    for k in [*recs, 'gripper']:
         if meta.get(k, {}).get('error'):
             print(f'{k} ERROR: {meta[k]["error"]}')
 

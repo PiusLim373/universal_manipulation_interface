@@ -1,0 +1,11 @@
+# Arduino UNO R4 Minima (gripper opening + force) -> /dev/gripper_sensor
+#
+# Install:
+#   sudo cp robospec_umi/99-gripper-sensor.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   ls -l /dev/gripper_sensor
+#
+# MODE 0666: open without being in the `dialout` group.
+# ID_MM_DEVICE_IGNORE: stop ModemManager probing the port on plug-in.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0069", SYMLINK+="gripper_sensor", MODE="0666", ENV{ID_MM_DEVICE_IGNORE}="1"

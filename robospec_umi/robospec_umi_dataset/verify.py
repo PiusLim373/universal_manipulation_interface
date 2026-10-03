@@ -21,6 +21,8 @@ import sys
 import av
 import numpy as np
 
+import timeline as TL
+
 HERE = os.path.dirname(os.path.abspath(__file__))   # .../robospec_umi_dataset
 REPO = os.path.dirname(os.path.dirname(HERE))
 DATA = os.path.join(REPO, 'data')
@@ -147,6 +149,43 @@ def check_wrist(d, meta, log):
     log(f'    size {os.path.getsize(vid)/1e6:.1f} MB')
 
 
+def check_gripper(d, log):
+    """The opening is a trained action: an episode without it cannot be used."""
+    log('\nGRIPPER')
+    side = os.path.join(d, 'gripper', 'gripper_ts.npz')
+    if not os.path.exists(side):
+        log.fail(' missing gripper_ts.npz -- recorded without the gripper sensor',
+                 'no gripper recording')
+        return
+    z = np.load(side)
+    t = z['t_ns']
+    if len(t) < 2:
+        log.fail(f' {len(t)} gripper samples', 'no gripper samples')
+        return
+    if not np.all(np.diff(t) > 0):
+        log.fail(' gripper timestamps are not strictly increasing',
+                 'gripper non-monotonic timestamps')
+    d_ms = np.diff(t.astype(np.float64)) / 1e6
+    log(f'    {len(t)} samples over {(t[-1]-t[0])/1e9:.2f} s = '
+        f'{len(t)/((t[-1]-t[0])/1e9):.1f} Hz   interval ms: median {np.median(d_ms):.1f}  '
+        f'p99 {np.percentile(d_ms, 99):.1f}  max {d_ms.max():.1f}')
+    w = np.clip(z['raw'] / float(z['raw_open']), 0, 1) * float(z['max_width_m']) * 1000
+    log(f'    opening {w.min():.1f} .. {w.max():.1f} mm')
+    if d_ms.max() > TL.MAX_GRIPPER_GAP * 1000:
+        n = int((d_ms > TL.MAX_GRIPPER_GAP * 1000).sum())
+        log.warn(f' {n} gap(s) over {TL.MAX_GRIPPER_GAP*1000:.0f} ms (max {d_ms.max():.0f} ms); '
+                 'grid points inside are dropped', f'gripper gaps up to {d_ms.max():.0f} ms')
+    wp = os.path.join(d, 'wrist', 'wrist_ts.npz')
+    if os.path.exists(wp):
+        wt = np.load(wp)['t_ns']
+        out = int(((wt < t[0]) | (wt > t[-1])).sum())
+        if out:
+            log.warn(f' {out}/{len(wt)} wrist frames outside the gripper recording',
+                     f'{out} wrist frames outside the gripper recording')
+        else:
+            log(OK + ' gripper recording covers every wrist frame')
+
+
 def check_overlap(d, log):
     """Both streams must cover the same wall-clock window."""
     sp = os.path.join(d, 'scene', 'scene_ts.npz')
@@ -237,6 +276,7 @@ def verify_session(d, intrinsics=None):
             check_scene(p, meta, log)
         if os.path.isdir(os.path.join(p, 'wrist')):
             check_wrist(p, meta, log)
+        check_gripper(p, log)
         check_overlap(p, log)
         fails = top.fails + log.fails
         episodes[ep] = {'ok': not fails, 'fails': fails, 'warnings': log.warns}

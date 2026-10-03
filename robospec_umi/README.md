@@ -19,7 +19,8 @@ robospec_umi/
 ├── robospec_umi_conda.yaml
 ├── robospec_umi.Dockerfile
 ├── robospec_umi_compose.yaml
-└── 99-decxin-cam.rules         pins the scene camera to /dev/scene_cam
+├── 99-decxin-cam.rules         pins the scene camera to /dev/scene_cam
+└── 99-gripper-sensor.rules     pins the gripper Arduino to /dev/gripper_sensor
 ```
 
 Everything reads and writes under `data/` at the repo root:
@@ -82,10 +83,14 @@ DECXIN's second node opens fine and returns nothing.
 
 ```bash
 sudo cp robospec_umi/99-decxin-cam.rules /etc/udev/rules.d/
+sudo cp robospec_umi/99-gripper-sensor.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-ls -l /dev/scene_cam
+ls -l /dev/scene_cam /dev/gripper_sensor
 v4l2-ctl -d /dev/scene_cam --all | head    # must say DECXIN, not RealSense
 ```
+
+The gripper rule does the same for the Arduino UNO R4 on the gripper (`2341:0069`),
+which is `/dev/ttyACM<N>` in whatever order USB enumerated it.
 
 Check the wrist camera too:
 
@@ -336,7 +341,16 @@ Keys work in the preview window *and* in the terminal, so a foot pedal that type
 ENTER drives it. `--no-display` runs headless on the terminal alone.
 
 Writes `data/capture/<datetime>/` with one `epNNN/` per episode, each holding
-`scene/scene.mkv` + `scene_ts.npz` and `wrist/wrist.mkv` + `wrist_ts.npz`.
+`scene/scene.mkv` + `scene_ts.npz`, `wrist/wrist.mkv` + `wrist_ts.npz`, and
+`gripper/gripper_ts.npz`.
+
+**The gripper is required.** A session will not start without `/dev/gripper_sensor`
+sending lines (`arduino/UMI_Force_Angle.ino`, ~40 Hz). Each line is stamped on
+arrival on the cameras' CLOCK_MONOTONIC. `gripper_ts.npz` keeps the raw pot
+reading and the raw force value as sent; the force is not used yet. The opening
+becomes `robot0_gripper_width` in metres: linear, raw 0 → 0 m, raw 1146 → 0.115 m
+(`GRIPPER_RAW_OPEN` / `GRIPPER_MAX_WIDTH` in `capture.py`, saved in each file). Both
+capture stages show it live. Sessions recorded before the gripper fail verify.
 
 **The preview is deliberately lossy.** It samples the stream and skips frames on
 purpose so recording never waits on the display. A large on-screen `skipped`

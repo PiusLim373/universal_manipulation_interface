@@ -1139,7 +1139,7 @@ async def capture_start(request):
         log_cap.exception('session failed to start')
         return json_err(400, str(e))
     SESSIONS[CAPTURE_KEY] = CapturePreview(sess)
-    log_cap.info('session %s started (%s) -> %s',
+    log_cap.info('session %s started (%s+gripper) -> %s',
                  sess.stamp, '+'.join(sess.recs), sess.dir)
     st = SESSIONS[CAPTURE_KEY].state()
     st['ok'] = True
@@ -1940,15 +1940,17 @@ def _timeline(d):
         # unwrapped over the kept frames: roll sits near +-180 on this rig
         rpy[use] = np.degrees(np.unwrap(np.radians(_rpy_deg(T[:, :3, :3])), axis=0))
     idx = _decimate(len(t))
-    gt, gw = TL.gripper_track(d)
-    gi = _decimate(len(gt))
+    grip = TL.gripper_track(d)
+    if grip is not None:
+        gt, gw = grip
+        gi = _decimate(len(gt))
+        grip = {'t': np.round(gt[gi] - t0, 4).tolist(), 'width': np.round(gw[gi] * 1000, 2).tolist()}
     return {
         't': np.round(t, 4).tolist(), 'status': tr['status'].tolist(),
         'status_names': TL.STATUS,
         'tcp': {'t': np.round(t[idx], 4).tolist(),
                 'xyz': _rows(xyz[idx]), 'rpy': _rows(rpy[idx])},
-        'gripper': {'t': np.round(gt[gi] - t0, 4).tolist(),
-                    'width': np.round(gw[gi] * 1000, 2).tolist()},
+        'gripper': grip,
         'duration_s': float(t[-1]), 'wrist_offset_s': meta['wrist_offset_s'],
         'wrist_duration_s': meta['wrist_duration_s'], 'meta': meta,
     }

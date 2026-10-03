@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils'
  * StrictMode double-invokes the mount effect; with an unstable prop that would
  * mean start -> stop -> start on a session owning two cameras and a 3 s warm-up.
  */
-export default function PreviewLock({ endpoints, onDone }) {
+export default function PreviewLock({ endpoints, onDone, aside }) {
   const ep = useRef(endpoints); ep.current = endpoints
   const done = useRef(onDone); done.current = onDone
 
@@ -125,6 +125,7 @@ export default function PreviewLock({ endpoints, onDone }) {
             )
           })}
         </div>
+        {live && aside?.(state)}
         {err && <p className="text-sm text-destructive shrink-0">{err}</p>}
         <div className="flex items-center gap-3 flex-wrap shrink-0">
           <div className="flex-1" />
