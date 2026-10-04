@@ -47,7 +47,7 @@ function buildCmd({ dataset, form, logging, mode, container, info }) {
   ]
   const head = mode === 'docker'
     ? [`docker exec -it -w /workspace -e ${ENV} ${shq(container)}`, 'python train.py']
-    : [`cd ${shq(info.repo)} && conda activate umi2 &&`, `${ENV} python train.py`]
+    : [`cd ${shq(info.repo)} && conda activate robospec_umi &&`, `${ENV} python train.py`]
   return [...head, ...args].map((l, i, a) => (i ? '  ' : '') + l + (i < a.length - 1 ? ' \\' : '')).join('\n')
 }
 
@@ -323,7 +323,7 @@ export default function Training() {
                 </label>
               ) : (
                 <span className="text-xs text-muted-foreground pb-2">
-                  runs from <code>{info?.repo}</code> in the <code>umi2</code> conda env
+                  runs from <code>{info?.repo}</code> in the <code>robospec_umi</code> conda env
                 </span>
               )}
               <span className="flex-1" />

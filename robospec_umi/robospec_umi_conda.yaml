@@ -1,11 +1,9 @@
-# Clone of the working `umi2` environment: UMI on an RTX 5070 (Blackwell, sm_120).
-#
 # Verified on this env: ChArUco -> zarr -> UmiDataset -> GPU training step, with
 # torch reporting kernels ['sm_75'...'sm_100','sm_120','compute_120'] and a real
 # CUDA matmul running. Peak VRAM at dataloader batch_size=8 is 6401 MiB of 8151.
 #
-#   conda env create -f conda_environment_umi2.yaml
-#   conda activate umi2
+#   conda env create -f robospec_umi_conda.yaml
+#   conda activate robospec_umi
 #   python -c "import torch; print(torch.__version__, \
 #       'sm_120' in torch.cuda.get_arch_list())"   # must print True
 #
@@ -29,7 +27,7 @@
 # The `pytorch` conda channel is gone from the channel list since nothing is taken
 # from it any more.
 
-name: umi2
+name: robospec_umi
 channels:
   - nvidia
   - conda-forge

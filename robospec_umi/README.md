@@ -165,7 +165,7 @@ Four things worth knowing:
 
 ```bash
 conda env create -f robospec_umi/robospec_umi_conda.yaml
-conda activate umi2
+conda activate robospec_umi
 sudo apt install v4l-utils     # the scripts shell out to v4l2-ctl
 ```
 

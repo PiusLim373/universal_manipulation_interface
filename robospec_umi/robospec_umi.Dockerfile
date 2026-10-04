@@ -67,7 +67,7 @@ RUN micromamba create -y -f /tmp/env.yaml && \
 
 # Activation by PATH instead of an entrypoint wrapper: every RUN, CMD and
 # `compose exec` gets the env without needing a login shell.
-ENV PATH=/opt/conda/envs/umi2/bin:$PATH
+ENV PATH=/opt/conda/envs/robospec_umi/bin:$PATH
 
 # mujoco_py cythonises cymj.pyx on FIRST import and writes the result into
 # site-packages. Done here as root it is baked into the image; left until runtime
@@ -92,7 +92,7 @@ RUN groupadd -g ${GID} robospec && \
     # not just the first, so pre-compiling above is not enough -- that directory
     # has to stay writable by the user actually running it.
     chown -R ${UID}:${GID} \
-      /opt/conda/envs/umi2/lib/python3.9/site-packages/mujoco_py/generated \
+      /opt/conda/envs/robospec_umi/lib/python3.9/site-packages/mujoco_py/generated \
       2>/dev/null || true
 
 USER robospec
