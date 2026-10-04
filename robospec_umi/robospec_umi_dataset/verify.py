@@ -22,6 +22,7 @@ import av
 import numpy as np
 
 import timeline as TL
+import video_processor_charuco as V
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # .../robospec_umi_dataset
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -186,6 +187,48 @@ def check_gripper(d, log):
             log(OK + ' gripper recording covers every wrist frame')
 
 
+def check_imu(d, meta, log):
+    """The D455's IMU feeds the gyro fusion. Warnings only: without it the pose
+    track is vision only, as before."""
+    side = os.path.join(d, 'imu', 'imu_ts.npz')
+    if not os.path.exists(side):
+        if meta.get('wrist', {}).get('model') == 'D455':
+            log('\nIMU')
+            log.warn(' missing imu_ts.npz -- the pose track will be vision only',
+                     'no imu recording')
+        return
+    log('\nIMU')
+    z = np.load(side)
+    gap = V.GYRO_MAX_GAP * 1000
+    for k in ('gyro', 'accel'):
+        t = z[f'{k}_t_ns']
+        if len(t) < 2:
+            log.warn(f' {len(t)} {k} samples', f'no imu {k} samples')
+            continue
+        d_ms = np.diff(t.astype(np.float64)) / 1e6
+        hz = (len(t) - 1) / ((t[-1] - t[0]) / 1e9)
+        log(f'    {k:5s} {len(t)} samples = {hz:.1f} Hz   interval ms: median '
+            f'{np.median(d_ms):.2f}  max {d_ms.max():.2f}')
+        if not np.all(d_ms > 0):
+            log.warn(f' {k} timestamps are not strictly increasing',
+                     f'imu {k} non-monotonic timestamps')
+        if not 190 <= hz <= 215:
+            log.warn(f' {k} at {hz:.0f} Hz, expected ~200', f'imu {k} at {hz:.0f} Hz')
+        if d_ms.max() > gap:
+            log.warn(f' {k} gap of {d_ms.max():.0f} ms; over {gap:.0f} ms the gyro '
+                     'fusion falls back to vision', f'imu {k} gap {d_ms.max():.0f} ms')
+    wp = os.path.join(d, 'wrist', 'wrist_ts.npz')
+    tg = z['gyro_t_ns']
+    if os.path.exists(wp) and len(tg) >= 2:
+        wt = np.load(wp)['t_ns']
+        out = int(((wt < tg[0]) | (wt > tg[-1])).sum())
+        if out:
+            log.warn(f' {out}/{len(wt)} wrist frames outside the imu recording',
+                     f'{out} wrist frames outside the imu recording')
+        else:
+            log(OK + ' imu recording covers every wrist frame')
+
+
 def check_overlap(d, log):
     """Both streams must cover the same wall-clock window."""
     sp = os.path.join(d, 'scene', 'scene_ts.npz')
@@ -277,6 +320,7 @@ def verify_session(d, intrinsics=None):
         if os.path.isdir(os.path.join(p, 'wrist')):
             check_wrist(p, meta, log)
         check_gripper(p, log)
+        check_imu(p, meta, log)
         check_overlap(p, log)
         fails = top.fails + log.fails
         episodes[ep] = {'ok': not fails, 'fails': fails, 'warnings': log.warns}

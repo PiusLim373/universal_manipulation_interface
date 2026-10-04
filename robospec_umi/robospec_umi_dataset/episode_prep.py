@@ -16,6 +16,7 @@ wrist's start on the scene clock.
 
 Usage:
     python3 robospec_umi/robospec_umi_dataset/episode_prep.py data/capture/<stamp>/ep000 [...]
+    python3 robospec_umi/robospec_umi_dataset/episode_prep.py --calibrate-imu data/capture/<stamp>/ep*
 """
 
 import argparse
@@ -45,7 +46,7 @@ GREEN, AMBER, RED, GREY = (90, 210, 90), (40, 190, 245), (60, 60, 235), (150, 15
 BANNER = {
     TL.OK: ('OK', GREEN),
     TL.LOST: ('LOST - board not tracked', RED),
-    TL.SPIKE: ('SPIKE - depth-ambiguity flip', RED),
+    TL.SPIKE: ('SPIKE - pose rejected (flip or bad corners)', RED),
     TL.OUTSIDE: ("OUTSIDE - beyond the cameras' overlap", GREY),
     TL.POSE_GAP: ('INVALID - pose gap too wide to interpolate', AMBER),
     TL.NO_WRIST: ('INVALID - no wrist frame close enough', AMBER),
@@ -81,7 +82,8 @@ def summary(m):
     u = m['untrimmed']
     kept = (f'kept {u["kept_s"]:.1f} s' if u['reason'] is None
             else f'dropped: {u["reason"]}')
-    return f'tracked {m["tracked"]:.0%}, usable {u["usable"]:.0%}, {kept}'
+    imu = ', imu fused' if (m.get('imu') or {}).get('fused') else ''
+    return f'tracked {m["tracked"]:.0%}, usable {u["usable"]:.0%}, {kept}{imu}'
 
 
 def _save_npz(path, **arrays):
@@ -170,23 +172,36 @@ def detect(ep_dir, progress):
     return dets
 
 
+def gyro_input(ep_dir, t):
+    """The episode's gyro + rig constants for V.track, or None without an IMU."""
+    imu = TL.imu_track(ep_dir)
+    if imu is None:
+        return None
+    return {'t': t, 'tg': imu['tg'], 'w': imu['w'],
+            'R_board_imu': np.array(TL.IMU_ROTATION), 'offset': TL.IMU_TIME_OFFSET}
+
+
 def track(ep_dir, dets, cam):
-    """-> (rows, status, t_ns); writes scene_tcp.npz."""
+    """-> (rows, status, t_ns, imu info); writes scene_tcp.npz."""
     ts = _ts(ep_dir, 'scene')
     n = min(len(dets), len(ts))      # an interrupted recording can differ by a tail
     dets, ts = dets[:n], ts[:n]
+    t = ts.astype(np.float64) / 1e9
     chess, markers = V.board_geometry(V.make_board(*TL.board_args()))
     tcp = V.make_T(V.parse_rotation(TL.TCP_ROTATION), TL.TCP_OFFSET)
-    rows = V.track(dets, chess, markers, cam, V.board_centre(chess), tcp)
+    rows = V.track(dets, chess, markers, cam, V.board_centre(chess), tcp,
+                   gyro=gyro_input(ep_dir, t))
+    imu = V.track.imu or {'fused': False, 'reason': 'no imu recording'}
 
     tracked = np.array([r[1] is not None for r in rows], bool)
+    # corners the fused rotation disagrees with: the board is there, the pose is not
+    rejected = np.array([r[4] == 'imu rejected' for r in rows], bool)
     T = np.full((n, 4, 4), np.nan)
     good = np.nonzero(tracked)[0]
     for i in good:
         T[i] = rows[i][1]
 
-    t = ts.astype(np.float64) / 1e9
-    spiked = np.zeros(n, bool)
+    spiked = rejected.copy()
     grid, gap_ok, near_ok = np.empty(0), np.empty(0, bool), np.empty(0, bool)
     if len(good) >= 2:
         pose_t, _, keep = TL.drop_spikes(t[good], [T[i] for i in good], TL.MAX_SPIKE)
@@ -194,12 +209,12 @@ def track(ep_dir, dets, cam):
         grid, _, gap_ok, near_ok = TL.build_grid(
             pose_t, TL.wrist_times(ep_dir), TL.GRID_HZ, TL.MAX_POSE_GAP,
             TL.MAX_FRAME_DIST, TL.DELTA)
-    status = TL.frame_status(t, tracked, spiked, grid, gap_ok, near_ok)
+    status = TL.frame_status(t, tracked | rejected, spiked, grid, gap_ok, near_ok)
 
     _save_npz(TL.ep_path(ep_dir, TL.TCP_NPZ), t_ns=ts, T_tcp=T,
               rms=np.array([r[5] for r in rows], np.float64),
               n_pts=np.array([r[2] for r in rows], np.int32), status=status)
-    return rows, status, ts
+    return rows, status, ts, imu
 
 
 def render(ep_dir, dets, rows, status, ts, cam, progress):
@@ -262,7 +277,7 @@ def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=Tru
         w, h = c.streams.video[0].width, c.streams.video[0].height
     cam = V.load_intrinsics(intr_path, w, h)
     progress('track', 0, 1)
-    rows, status, ts = track(ep_dir, dets, cam)     # cheap once detections are cached
+    rows, status, ts, imu = track(ep_dir, dets, cam)   # cheap once detections are cached
     if videos:
         render(ep_dir, dets, rows, status, ts, cam, progress)
 
@@ -280,6 +295,7 @@ def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=Tru
         'wrist_duration_s': float((wts[-1] - wts[0]) / 1e9),
         'tracked': float((status != TL.LOST).mean()),
         'status_counts': {s: int(n) for s, n in zip(TL.STATUS, counts)},
+        'imu': imu,
         'untrimmed': {k: plan[k] for k in ('usable', 'kept_s', 'reason', 'note')},
     }
     tmp = marker + '.tmp'
@@ -287,6 +303,47 @@ def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=Tru
         json.dump(meta, f, indent=2)
     os.replace(tmp, marker)
     return meta
+
+
+def calibrate_imu(ep_dirs, intr_path):
+    """Pool the episodes' vision tracks and gyros -> print the IMU rig constants."""
+    chess, markers = V.board_geometry(V.make_board(*TL.board_args()))
+    T_c = V.board_centre(chess)
+    tcp = V.make_T(V.parse_rotation(TL.TCP_ROTATION), TL.TCP_OFFSET)
+    eps, cam = [], None
+    for d in ep_dirs:
+        imu = TL.imu_track(d)
+        if imu is None:
+            print(f'{d}: no imu recording, skipped')
+            continue
+        dets = detect(d, lambda *a: None)
+        ts = _ts(d, 'scene')
+        n = min(len(dets), len(ts))
+        dets, t = dets[:n], ts[:n].astype(np.float64) / 1e9
+        if cam is None:
+            with av.open(os.path.join(d, 'scene', 'scene.mkv')) as c:
+                cam = V.load_intrinsics(intr_path, c.streams.video[0].width,
+                                        c.streams.video[0].height)
+        rows = V.track(dets, chess, markers, cam, T_c, tcp)
+        R, sig = V.vision_rotations(dets, rows, chess, markers, cam, T_c)
+        ok = np.isfinite(sig)
+        good = np.nonzero(ok)[0]
+        if len(good) >= 2:      # vision spikes stay out of the fit
+            _, _, keep = TL.drop_spikes(t[good], [rows[i][1] for i in good], TL.MAX_SPIKE)
+            ok[good[~keep]] = False
+        eps.append({'t': t, 'R': R, 'sig': sig, 'ok': ok, 'tg': imu['tg'], 'w': imu['w']})
+    if not eps:
+        raise SystemExit('no episode with an imu recording')
+    off, R_bi, b, st = V.calibrate_gyro(eps)
+    moved = np.degrees(np.linalg.norm(V.so3_log(R_bi.T @ np.array(TL.IMU_ROTATION))))
+    print(f'calibration over {len(eps)} episodes: speed corr {st["speed_corr"]:.3f}, '
+          f'increments {st["increments"]}, residual {st["residual_deg"]:.2f} deg '
+          f'per {V.INC_S} s')
+    print(f'gyro bias {np.degrees(b).round(3)} deg/s (fitted per episode in the pipeline)')
+    print(f'{moved:.2f} deg from the current IMU_ROTATION, '
+          f'{(off - TL.IMU_TIME_OFFSET) * 1000:+.1f} ms from IMU_TIME_OFFSET\n')
+    rows = ',\n                '.join('(' + ', '.join(f'{v:.4f}' for v in r) + ')' for r in R_bi)
+    print(f'IMU_ROTATION = ({rows})\nIMU_TIME_OFFSET = {off:.4f}   # s')
 
 
 def main():
@@ -297,9 +354,14 @@ def main():
     ap.add_argument('--force', action='store_true', help='rebuild even if cached')
     ap.add_argument('--no-videos', action='store_true',
                     help='only what export needs: detections and the pose track')
+    ap.add_argument('--calibrate-imu', action='store_true',
+                    help='print IMU_ROTATION / IMU_TIME_OFFSET for timeline.py from '
+                         'these episodes, and prep nothing')
     args = ap.parse_args()
     av.logging.set_level(av.logging.PANIC)   # MJPEG APP-marker and pix-fmt noise
     cv2.setNumThreads(4)
+    if args.calibrate_imu:
+        return calibrate_imu([os.path.abspath(e) for e in args.episodes], args.intrinsics)
 
     for ep in args.episodes:
         def progress(stage, i, n):

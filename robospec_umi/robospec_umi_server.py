@@ -1711,7 +1711,7 @@ class PrepQueue:
 
     @staticmethod
     def _summary(meta):
-        return {k: meta.get(k) for k in ('tracked', 'untrimmed', 'duration_s', 'prepared_at')}
+        return {k: meta.get(k) for k in ('tracked', 'untrimmed', 'duration_s', 'prepared_at', 'imu')}
 
     def want(self, keys, focus=None, pid=None, sha1=None):
         key = _prep_key()
@@ -1932,9 +1932,9 @@ def _rows(a):
 
 
 def _timeline(d):
-    """Per-frame status plus the absolute TCP pose (scene-camera frame) and the
-    gripper width, decimated for the graphs. Lost and spike frames are left out
-    of the pose, as export leaves them out."""
+    """Per-frame status plus the absolute TCP pose (scene-camera frame), the
+    gripper width and the IMU, decimated for the graphs. Lost and spike frames are
+    left out of the pose, as export leaves them out."""
     tr = TL.load_track(d)
     meta = EP.read_prep(d)
     t0 = tr['t_ns'][0] / 1e9
@@ -1953,12 +1953,21 @@ def _timeline(d):
         gt, gw = grip
         gi = _decimate(len(gt))
         grip = {'t': np.round(gt[gi] - t0, 4).tolist(), 'width': np.round(gw[gi] * 1000, 2).tolist()}
+    imu = TL.imu_track(d)
+    if imu is not None:
+        # gyro on the scene clock; accel resampled onto the gyro's times for one axis
+        tg = imu['tg'] + TL.IMU_TIME_OFFSET
+        gi = _decimate(len(tg))
+        acc = np.stack([np.interp(tg[gi], imu['ta'], imu['a'][:, k]) for k in range(3)], 1)
+        imu = {'t': np.round(tg[gi] - t0, 4).tolist(),
+               'gyro': _rows(np.degrees(imu['w'][gi])), 'accel': _rows(acc)}
     return {
         't': np.round(t, 4).tolist(), 'status': tr['status'].tolist(),
         'status_names': TL.STATUS,
         'tcp': {'t': np.round(t[idx], 4).tolist(),
                 'xyz': _rows(xyz[idx]), 'rpy': _rows(rpy[idx])},
         'gripper': grip,
+        'imu': imu,
         'wrist_crop': _wrist_crop(d),
         'duration_s': float(t[-1]), 'wrist_offset_s': meta['wrist_offset_s'],
         'wrist_duration_s': meta['wrist_duration_s'], 'meta': meta,

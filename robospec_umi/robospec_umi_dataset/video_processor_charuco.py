@@ -23,6 +23,11 @@ The board is planar, so PnP has the usual two-fold depth-flip ambiguity when it 
 seen small and near fronto-parallel. IPPE picks the lower-error branch, and the
 previous frame's pose seeds the refinement to keep the track on one branch.
 
+Optional gyro fusion (track(gyro=...), see fuse_gyro): the integrated gyro gives
+the rotation's shape and vision anchors it, then translation is re-solved with
+that rotation held. Board rotation noise times the ~171 mm arm is most of the TCP
+jitter, and a flipped pose disagrees with the gyro by degrees, so both go.
+
 This file is deliberately standalone -- stdlib, cv2 and numpy only. episode_prep.py
 imports it for the solver and the seed-poisoning guards in track(); it is also
 runnable on its own for one-off analysis of a recorded folder.
@@ -401,8 +406,11 @@ def solve_board(det, chess, markers, cam, guess=None, source='auto'):
 
 # ------------------------------------------------------------------- tracking
 def track(dets, chess, markers, cam, T_centre, T_centre_tcp, source='auto',
-          max_rms=5.0):
+          max_rms=5.0, gyro=None):
     """Per-frame (T_cam_centre, T_cam_tcp, n_points, ids, source, rms); None where lost.
+
+    gyro: {'t': frame times s, 'tg', 'w', 'R_board_imu', 'offset'} fuses the gyro
+    into the vision track (fuse_gyro); track.imu then holds its info, else None.
 
     The previous pose seeds the next solve, which speeds up the refinement and
     keeps the planar flip ambiguity from toggling between frames.
@@ -435,7 +443,279 @@ def track(dets, chess, markers, cam, T_centre, T_centre_tcp, source='auto',
         T_cam_centre = T @ T_centre
         rows.append((T_cam_centre, T_cam_centre @ T_centre_tcp, n, ids, src, rms))
     track.rejected = rejected
+    track.imu = None
+    if gyro is not None:
+        rows, track.imu = fuse_gyro(dets, rows, gyro, cam, chess, markers,
+                                    T_centre, T_centre_tcp)
     return rows
+
+
+# ---------------------------------------------------------------- gyro fusion
+SIGMA_PX = 0.3          # corner noise behind the per-frame rotation uncertainty
+FUSION_WINDOW = 0.5     # s; the vision correction's smoothing span
+INC_S = 0.25            # s; rotation increments the bias fit and calibration compare
+FUSED_MAX_RMS = 1.5     # px; with the rotation held, good frames fit < 0.6
+GYRO_MAX_GAP = 0.05     # s; a longer gyro hole (or uncovered scene edge) disables fusion
+MIN_INCREMENTS = 20
+MAX_RESIDUAL = 0.8      # deg; measured 0.35-0.49 when the rig constants are right
+
+
+def so3_exp(rv):
+    """(N,3) rotation vectors -> (N,3,3)."""
+    rv = np.asarray(rv, np.float64).reshape(-1, 3)
+    th = np.linalg.norm(rv, axis=1)
+    k = rv / np.maximum(th, 1e-12)[:, None]
+    K = np.zeros((len(rv), 3, 3))
+    K[:, 0, 1], K[:, 0, 2], K[:, 1, 2] = -k[:, 2], k[:, 1], -k[:, 0]
+    K[:, 1, 0], K[:, 2, 0], K[:, 2, 1] = k[:, 2], -k[:, 1], k[:, 0]
+    s, c = np.sin(th)[:, None, None], np.cos(th)[:, None, None]
+    return np.eye(3) + s * K + (1 - c) * (K @ K)
+
+
+def so3_log(R):
+    """(N,3,3) -> (N,3) rotation vectors."""
+    R = np.asarray(R, np.float64).reshape(-1, 3, 3)
+    v = np.stack([R[:, 2, 1] - R[:, 1, 2], R[:, 0, 2] - R[:, 2, 0],
+                  R[:, 1, 0] - R[:, 0, 1]], 1)
+    s2 = np.linalg.norm(v, axis=1)                       # 2 sin(theta)
+    th = np.arctan2(s2 / 2, (np.trace(R, axis1=1, axis2=2) - 1) / 2)
+    out = v * np.where(s2 > 1e-12, th / np.maximum(s2, 1e-12), 0.5)[:, None]
+    for i in np.nonzero(th > np.pi - 1e-3)[0]:          # axis is lost near pi
+        out[i] = cv2.Rodrigues(R[i])[0].ravel()
+    return out
+
+
+def T_inv(R):
+    return np.swapaxes(R, -1, -2)
+
+
+def kabsch(a, b):
+    """R minimising |a - R b| over rows."""
+    U, _, Vt = np.linalg.svd(a.T @ b)
+    return U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+
+
+def integrate_gyro(tg, w, t):
+    """Gyro (rad/s) -> IMU orientation at times t, relative to the first sample."""
+    wm = (w[:-1] + w[1:]) / 2
+    D = so3_exp(wm * np.diff(tg)[:, None])
+    G = np.empty((len(tg), 3, 3))
+    G[0] = np.eye(3)
+    for k, d in enumerate(D):
+        G[k + 1] = G[k] @ d
+    k = np.clip(np.searchsorted(tg, t) - 1, 0, len(wm) - 1)
+    return G[k] @ so3_exp(wm[k] * (t - tg[k])[:, None])
+
+
+def vision_rotations(dets, rows, chess, markers, cam, T_centre):
+    """-> (R (n,3,3), sigma (n,)) of the vision track; sigma is inf where lost.
+    sigma is the rotation uncertainty (rad) from the PnP Jacobian."""
+    n = len(rows)
+    R, sig = np.full((n, 3, 3), np.nan), np.full(n, np.inf)
+    T_c_inv = np.linalg.inv(T_centre)
+    for i, (d, r) in enumerate(zip(dets, rows)):
+        if r[0] is None:
+            continue
+        R[i] = r[0][:3, :3]
+        obj = observations(d, chess, markers, 'auto')[0]
+        rv, tv = rt_from_T(r[0] @ T_c_inv)
+        J = cv2.projectPoints(obj, rv, tv, cam.K, cam.zero)[1][:, :6]
+        sig[i] = SIGMA_PX * np.sqrt(np.trace(np.linalg.pinv(J.T @ J)[:3, :3]) / 3)
+    return R, sig
+
+
+def increments(t, R, ok):
+    """Frame pairs INC_S apart, both ok -> (index, span)."""
+    span = max(1, int(round(INC_S / np.median(np.diff(t)))))
+    return np.nonzero(ok[:-span] & ok[span:])[0], span
+
+
+def fit_gyro_bias(t, R, ok, tg, w, R_bi, iters=4):
+    """Gyro bias with the rig rotation and offset held -> (bias, residual deg, n).
+    Medians throughout, so a vision spike needs no separate mask."""
+    i, span = increments(t, R, ok)
+    if len(i) < MIN_INCREMENTS:
+        return np.zeros(3), np.inf, len(i)
+    pb = so3_log(T_inv(R[i]) @ R[i + span])
+    dts = (t[i + span] - t[i])[:, None]
+    b = np.zeros(3)
+    for _ in range(iters):
+        G = integrate_gyro(tg, w - b, t)
+        pi = so3_log(T_inv(G[i]) @ G[i + span])
+        b += np.median((pi - pb @ R_bi) / dts, axis=0)
+    G = integrate_gyro(tg, w - b, t)
+    pi = so3_log(T_inv(G[i]) @ G[i + span])
+    res = np.linalg.norm(pb - pi @ R_bi.T, axis=1)
+    return b, float(np.degrees(np.median(res))), len(i)
+
+
+def robust_smooth(t, e, w0, sig, window, iters=4):
+    """Local-linear fit of e(t): tricube kernel, bisquare reweighting on residuals
+    scaled by each frame's sigma. -> (fit, robust weights), or (None, None)."""
+    h = window / 2
+    lo, hi = np.searchsorted(t, t - h, 'right'), np.searchsorted(t, t + h, 'left')
+    rob = np.ones(len(t))
+    fit = np.full_like(e, np.nan)
+    for _ in range(iters):
+        for i in range(len(t)):
+            s = slice(lo[i], hi[i])
+            dt, m = t[s] - t[i], w0[s] > 0
+            k = (1 - (np.abs(dt[m]) / h) ** 3) ** 3 * w0[s][m] * rob[s][m]
+            if m.sum() < 3 or k.sum() <= 0:
+                fit[i] = np.nan
+                continue
+            X = np.stack([np.ones(m.sum()), dt[m]], 1)
+            XtW = X.T * k
+            fit[i] = np.linalg.lstsq(XtW @ X, XtW @ e[s][m], rcond=None)[0][0]
+        z = np.linalg.norm(e - fit, axis=1) / sig
+        scale = 1.4826 * np.nanmedian(z[w0 > 0])
+        rob = np.where(w0 > 0, np.clip(1 - (z / (4.685 * scale)) ** 2, 0, None) ** 2, 0)
+        rob = np.nan_to_num(rob)
+    bad = np.isnan(fit[:, 0])
+    if bad.all():
+        return None, None
+    for k in range(3):    # a window with no vision inherits its neighbours' correction
+        fit[bad, k] = np.interp(t[bad], t[~bad], fit[~bad, k])
+    return fit, rob
+
+
+def solve_translation(det, R, chess, markers, cam):
+    """Board translation with the rotation held, linear in t -> (t, rms px, n).
+    With the rotation known a mislocated corner stands out, so outliers go."""
+    obj, img = [], []
+    if det['ids'] is not None:
+        obj.append(chess[det['ids']])
+        img.append(det['corners'])
+    if det['ids'] is None or len(det['ids']) < 3:
+        for m, c in det['markers'].items():
+            if m in markers:
+                obj.append(markers[m])
+                img.append(c)
+    if not obj:
+        return None
+    obj, img = np.concatenate(obj), np.concatenate(img)
+    x = (cam.undistort(img) - cam.K[:2, 2]) / np.diag(cam.K)[:2]
+    Q = obj @ R.T
+    A, rhs = np.zeros((2 * len(x), 3)), np.zeros(2 * len(x))
+    for a in (0, 1):
+        A[a::2, a], A[a::2, 2] = 1, -x[:, a]
+        rhs[a::2] = x[:, a] * Q[:, 2] - Q[:, a]
+    keep = np.ones(len(obj), bool)
+    for it in range(4):
+        k2 = np.repeat(keep, 2)
+        tb = np.linalg.lstsq(A[k2], rhs[k2], rcond=None)[0]
+        p, good = cam.project(obj, cv2.Rodrigues(R)[0], tb)
+        err = np.where(good, np.linalg.norm(p - img, axis=1), np.inf)
+        bad = keep & (err > max(1.0, 3 * np.median(err[keep])))
+        if it == 3 or not bad.any() or (keep & ~bad).sum() < 2:
+            break
+        keep &= ~bad
+    return tb, float(np.sqrt(np.mean(err[keep] ** 2))), int(keep.sum())
+
+
+def fuse_gyro(dets, rows, gyro, cam, chess, markers, T_centre, T_centre_tcp):
+    """Vision rows + gyro -> (rows, info). Falls back to the vision rows, with
+    info['reason'], when the gyro cannot be trusted for this episode.
+
+    R(t) = A(t) H(t): H is the integrated gyro in the board frame, A the slow
+    correction fitted to vision by robust_smooth, weighted by each frame's sigma.
+    """
+    t, w, R_bi = gyro['t'], gyro['w'], np.asarray(gyro['R_board_imu'], np.float64)
+    tg = gyro['tg'] + gyro['offset']
+
+    def vision_only(why):
+        return rows, {'fused': False, 'reason': why}
+
+    if len(tg) < 2 or tg[0] - t[0] > GYRO_MAX_GAP or t[-1] - tg[-1] > GYRO_MAX_GAP:
+        return vision_only('the imu recording does not cover the scene frames')
+    if np.diff(tg).max() > GYRO_MAX_GAP:
+        return vision_only(f'gyro gap of {np.diff(tg).max() * 1000:.0f} ms')
+    R, sig = vision_rotations(dets, rows, chess, markers, cam, T_centre)
+    have = np.isfinite(sig)
+    b, resid, n_inc = fit_gyro_bias(t, R, have, tg, w, R_bi)
+    if n_inc < MIN_INCREMENTS:
+        return vision_only(f'too few tracked frames to fit the gyro ({n_inc} increments)')
+    if resid > MAX_RESIDUAL:
+        return vision_only(f'gyro and vision disagree ({resid:.2f} deg per {INC_S} s); '
+                           'the IMU rig constants may be stale -- re-run '
+                           'episode_prep.py --calibrate-imu')
+
+    H = integrate_gyro(tg, w - b, t) @ R_bi.T     # board orientation up to A
+    E = R[have] @ T_inv(H[have])
+    A0 = kabsch(np.eye(3), E.sum(0).T)            # chordal mean of E
+    e = np.zeros((len(t), 3))
+    e[have] = so3_log(A0.T @ E)
+    fit, rob = robust_smooth(t, e, np.where(have, 1 / sig ** 2, 0), sig, FUSION_WINDOW)
+    if fit is None:
+        return vision_only('vision too sparse to anchor the gyro')
+    Rf = A0 @ so3_exp(fit) @ H
+
+    out, n_vis, n_pose = [], 0, 0
+    for i, d in enumerate(dets):
+        r = solve_translation(d, Rf[i], chess, markers, cam)
+        if r is None:
+            out.append((None, None, 0, [], '', np.nan))
+            continue
+        if r[1] > FUSED_MAX_RMS:          # the corners disagree with the fused rotation
+            out.append((None, None, 0, [], 'imu rejected', r[1]))
+            n_pose += 1
+            continue
+        Tc = make_T(Rf[i], r[0]) @ T_centre
+        rejected = have[i] and rob[i] < 0.1
+        n_vis += rejected
+        ids = [] if d['ids'] is None else d['ids'].tolist()
+        out.append((Tc, Tc @ T_centre_tcp, r[2], ids,
+                    'imu, vision rejected' if rejected else 'imu', r[1]))
+    return out, {'fused': True, 'bias_dps': np.degrees(b).round(3).tolist(),
+                 'residual_deg': round(resid, 3), 'vision_rejected': int(n_vis),
+                 'pose_rejected': int(n_pose), 'window_s': FUSION_WINDOW}
+
+
+def _moving_average(x, n=5):
+    """Centred, edges mirrored, along axis 0."""
+    p = np.pad(x, ((n // 2, n // 2), (0, 0)), mode='symmetric')
+    return np.stack([np.convolve(c, np.ones(n) / n, 'valid') for c in p.T], 1)
+
+
+def calibrate_gyro(eps):
+    """The rig constants from pooled episodes, each {t, R, sig, ok, tg, w}.
+    -> (time offset s, R_board_imu, bias rad/s, stats). Re-run after remounting.
+
+    The offset maximises the angular-speed correlation; the rotation is Kabsch on
+    INC_S rotation increments (vision vs gyro), alternated with the bias.
+    """
+    offs = np.arange(-0.05, 0.05, 0.0005)
+    corr = np.zeros(len(offs))
+    for v in eps:
+        i = np.nonzero(v['ok'][:-1] & v['ok'][1:])[0]
+        wv = so3_log(T_inv(v['R'][i]) @ v['R'][i + 1]) / np.diff(v['t'])[i, None]
+        # smooth the vector, not the speed: noise inflates a magnitude
+        tv = (v['t'][i] + v['t'][i + 1]) / 2
+        sv = np.linalg.norm(_moving_average(wv), axis=1)
+        sg = np.linalg.norm(v['w'], axis=1)
+        corr += [np.corrcoef(np.interp(tv, v['tg'] + d, sg), sv)[0, 1] for d in offs]
+    off = float(offs[corr.argmax()])
+
+    sig_max = 2 * np.median(np.concatenate([v['sig'][v['ok']] for v in eps]))
+    R_bi, b = np.eye(3), np.zeros(3)
+    for _ in range(6):
+        pb, pi, dts = [], [], []
+        for v in eps:
+            G = integrate_gyro(v['tg'] + off, v['w'] - b, v['t'])
+            i, span = increments(v['t'], v['R'], v['ok'] & (v['sig'] < sig_max))
+            pb.append(so3_log(T_inv(v['R'][i]) @ v['R'][i + span]))
+            pi.append(so3_log(T_inv(G[i]) @ G[i + span]))
+            dts.append(v['t'][i + span] - v['t'][i])
+        pb, pi, dts = map(np.concatenate, (pb, pi, dts))
+        keep = np.ones(len(pb), bool)
+        for _ in range(2):
+            R_bi = kabsch(pb[keep], pi[keep])
+            res = np.linalg.norm(pb - pi @ R_bi.T, axis=1)
+            keep = res < 3 * np.median(res)
+        b += np.median((pi - pb @ R_bi)[keep] / dts[keep, None], axis=0)
+    return off, R_bi, b, {'speed_corr': float(corr.max() / len(eps)),
+                          'increments': f'{int(keep.sum())}/{len(keep)}',
+                          'residual_deg': float(np.degrees(np.median(res[keep])))}
 
 
 def jitter(positions):

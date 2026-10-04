@@ -196,8 +196,10 @@ def build(items, output, intr_path, workers=PREP_WORKERS):
             dropped.append({'episode': name, 'reason': plan['reason']})
             continue
         segs = plan['segments']
+        fused = bool(((P.read_prep(d) or {}).get('imu') or {}).get('fused'))
         for s in segs:
             s['name'] = f'{name}_s{s["seg"]}' if len(segs) > 1 else name
+            s['imu_fused'] = fused
             print(f'      -> {s["name"]}: {len(s["grid"])} steps '
                   f'({len(s["grid"])/TL.GRID_HZ:.1f}s)', flush=True)
             kept.append(s)
@@ -250,6 +252,7 @@ def build(items, output, intr_path, workers=PREP_WORKERS):
     print(f'\n{"="*60}')
     print(f'included {len(kept)} episodes, {total} steps at {TL.GRID_HZ:.0f} Hz '
           f'({total/TL.GRID_HZ:.1f} s)')
+    print(f'imu fused: {sum(s["imu_fused"] for s in kept)}/{len(kept)} episodes')
     for e in dropped:
         print(f'  excluded {e["episode"]}: {e["reason"]}')
     print(f'wrote {output}  ({size:.1f} MB)', flush=True)
@@ -258,7 +261,8 @@ def build(items, output, intr_path, workers=PREP_WORKERS):
             'recordings': len(items) - len(dropped), 'steps': int(total),
             'duration_s': round(total / TL.GRID_HZ, 2), 'size_mb': round(size, 1),
             'intrinsics': intr,
-            'included': [{'episode': s['name'], 'steps': len(s['grid'])} for s in kept],
+            'included': [{'episode': s['name'], 'steps': len(s['grid']),
+                          'imu_fused': s['imu_fused']} for s in kept],
             'dropped': dropped}
 
 

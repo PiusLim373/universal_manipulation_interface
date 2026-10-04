@@ -370,9 +370,10 @@ capture stages show it live. Sessions recorded before the gripper fail verify.
 
 **The D455's IMU is recorded too**, into `imu/imu_ts.npz`: gyro (rad/s) and accel
 (m/s²) at 200 Hz, each with its own `t_ns` on the same clock, plus the factory
-colour→IMU extrinsic. It is not processed yet. Its intrinsics are uncalibrated
-(factory identity). A D455 session will not start if the IMU does not; a D405 has
-none. Both capture stages show it live.
+colour→IMU extrinsic. The gyro is fused into the pose track (see below); the accel
+is not used yet. Its intrinsics are uncalibrated (factory identity). A D455
+session will not start if the IMU does not; a D405 has none. Both capture stages
+show it live.
 
 **The preview is deliberately lossy.** It samples the stream and skips frames on
 purpose so recording never waits on the display. A large on-screen `skipped`
@@ -428,6 +429,24 @@ resamples onto a 60 Hz grid and pairs each grid point with the nearest wrist
 frame. Grid points are chosen **by time, never by frame index** — the wrist drops
 frames in bursts, so striding every Nth frame stops being uniform the moment one
 is lost. The per-episode summary says what was thrown away and why.
+
+**Gyro fusion.** For an episode with `imu/imu_ts.npz`, `video_processor_charuco.track()`
+fuses the gyro into the vision track: the integrated gyro gives the rotation's
+shape, vision anchors it, and translation is re-solved with that rotation held.
+On 20261004_213326 it cut TCP jitter from ~2.0 to ~0.75 mm and removed every
+depth-flip spike; corner sets that disagree with the gyro are rejected (SPIKE) and
+interpolated over like any hole. The IMU→board rotation and the gyro's clock offset
+are rig constants (`IMU_ROTATION`, `IMU_TIME_OFFSET` in `timeline.py`); only the gyro
+bias is fitted per episode. After remounting the D455 or the board, re-measure them:
+
+```bash
+python robospec_umi/robospec_umi_dataset/episode_prep.py --calibrate-imu data/capture/<datetime>/ep*
+```
+
+If an episode's gyro and vision disagree by more than 0.8° per 0.25 s (stale
+constants), or the gyro has a gap over 50 ms, that episode stays vision only and
+`prep.json` says why. The Edit list tags episodes `imu` or `vision only`, and the
+export report lists which ones were fused.
 
 ---
 

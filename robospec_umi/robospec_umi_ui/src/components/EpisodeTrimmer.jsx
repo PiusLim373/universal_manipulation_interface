@@ -7,6 +7,7 @@ import TrimBar from '@/components/TrimBar'
 import { STATUS_LEGEND } from '@/lib/editStatus'
 import TcpGraph from '@/components/TcpGraph'
 import GripperGraph from '@/components/GripperGraph'
+import ImuGraph from '@/components/ImuGraph'
 import useHotkeys from '@/hooks/useHotkeys'
 import { Button } from '@/components/ui/button'
 import { api, sse } from '@/lib/api'
@@ -32,6 +33,21 @@ function frameAt(t, v) {
 }
 
 /* ------------------------------------------------------------ episode list */
+// fused: the gyro steadied the pose track. Fell back: there is an IMU, but the
+// track is vision only -- the title says why.
+function ImuTag({ imu }) {
+  if (!imu || (!imu.fused && imu.reason === 'no imu recording')) return null
+  return imu.fused
+    ? <span className="text-[10px] px-1 rounded border border-[#38bdf8]/50 text-[#38bdf8]"
+            title={`IMU-fused track; ${imu.vision_rejected + imu.pose_rejected} vision frames rejected`}>
+        imu
+      </span>
+    : <span className="text-[10px] px-1 rounded border border-[#f59e0b]/50 text-[#f59e0b]"
+            title={imu.reason}>
+        vision only
+      </span>
+}
+
 const EpisodeRow = memo(function EpisodeRow({ e, edit, prep, selected, onPick }) {
   const ref = useRef(null)
   useEffect(() => { if (selected) ref.current?.scrollIntoView({ block: 'nearest' }) }, [selected])
@@ -51,6 +67,7 @@ const EpisodeRow = memo(function EpisodeRow({ e, edit, prep, selected, onPick })
             {prep.meta.duration_s.toFixed(1)} s
           </span>
         )}
+        <ImuTag imu={prep?.status === 'done' ? prep.meta?.imu : null} />
         <span className="flex-1" />
         {trimmed && <Scissors className="size-3.5 text-primary" />}
         {e.locked ? <Lock className="size-3.5 text-muted-foreground" />
@@ -459,7 +476,12 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
                 )}
               </div>
               <TcpGraph tcp={tl.tcp} duration={tl.duration_s} time={time} trim={trim} />
-              <GripperGraph gripper={tl.gripper} duration={tl.duration_s} time={time} trim={trim} />
+              <div className="min-h-0 flex flex-col gap-1">
+                <GripperGraph className="flex-1" gripper={tl.gripper} duration={tl.duration_s}
+                              time={time} trim={trim} />
+                {tl.imu && <ImuGraph className="flex-1" imu={tl.imu} duration={tl.duration_s}
+                                     time={time} trim={trim} />}
+              </div>
             </div>
 
             <div className="space-y-1.5">

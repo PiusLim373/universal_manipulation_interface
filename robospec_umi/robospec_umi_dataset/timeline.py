@@ -37,6 +37,15 @@ def wrist_crop(w, h):
 TCP_OFFSET = (0.0, -0.155, 0.0725)
 TCP_ROTATION = ('x', '180', 'z', '90')
 
+# Board <- D455 IMU rotation, and the offset added to gyro stamps to land on the
+# scene clock. Fixed by how the D455 and the board are mounted; measured on
+# 20261004_213326. After remounting either, re-run:
+#   episode_prep.py --calibrate-imu data/capture/<session>/ep*
+IMU_ROTATION = ((1.0000, 0.0011, 0.0014),
+                (0.0012, 0.1644, -0.9864),
+                (-0.0013, 0.9864, 0.1644))
+IMU_TIME_OFFSET = -0.0025   # s
+
 GRID_HZ = 60.0          # matches umi.yaml; the policy is trained at this rate
 MIN_VALID = 0.90        # drop an episode below this fraction of usable grid points
 MIN_SEGMENT = 1.5       # s -- drop contiguous runs shorter than this
@@ -192,6 +201,19 @@ def gripper_track(ep_dir):
         return None
     w = np.clip(z['raw'] / float(z['raw_open']), 0.0, 1.0) * float(z['max_width_m'])
     return z['t_ns'].astype(np.float64) / 1e9, w
+
+
+def imu_track(ep_dir):
+    """-> {tg, w, ta, a}: gyro (s, rad/s) and accel (s, m/s^2) of the wrist IMU on
+    its own clock (IMU_TIME_OFFSET not applied), or None without a recording."""
+    p = os.path.join(ep_dir, 'imu', 'imu_ts.npz')
+    if not os.path.exists(p):
+        return None
+    z = np.load(p)
+    if len(z['gyro_t_ns']) < 2:
+        return None
+    return {'tg': z['gyro_t_ns'] / 1e9, 'w': z['gyro'].astype(np.float64),
+            'ta': z['accel_t_ns'] / 1e9, 'a': z['accel'].astype(np.float64)}
 
 
 def gripper_on_grid(ep_dir, grid):
