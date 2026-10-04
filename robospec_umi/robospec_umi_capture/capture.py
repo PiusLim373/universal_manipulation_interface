@@ -159,7 +159,7 @@ WRIST_MODELS = {
     # depth pipeline, not RGB appearance.
     'D405': {'size': (848, 480), 'fps': 90, 'exposure_unit_us': 1,
              'exposure_us': 6000, 'exposure_max_us': 10000, 'gain': 248,
-             'auto_exposure': None},
+             'auto_exposure': None, 'imu': False},
     # A separate RGB sensor, exposure in 100 us, gain 0..128. 848x480 tops out at
     # 60 fps and is broken on this unit, hence 640x360. Manual 1..109 (10.9 ms)
     # holds 89.9 fps; 110-111 give black frames, longer lowers the rate. Auto
@@ -167,8 +167,13 @@ WRIST_MODELS = {
     # See d455_test/d455_documentation.md.
     'D455': {'size': (640, 360), 'fps': 90, 'exposure_unit_us': 100,
              'exposure_us': 6000, 'exposure_max_us': 10900, 'gain': 64,
-             'auto_exposure': True},
+             'auto_exposure': True, 'imu': True},
 }
+
+# D455 IMU, gyro and accel both at this rate (accel actually runs ~203 Hz, so
+# always go by the timestamps). Factory intrinsics are identity: uncalibrated.
+IMU_HZ = 200
+IMU_STALE = 0.5             # s without a sample before the UI calls it stalled
 
 # What the wrist offers a UI; enable_auto_exposure only where the model allows it.
 # Auto white balance is fine on both -- no frame-rate or brightness cost.
@@ -618,10 +623,10 @@ class WristRecorder(GatedRecorder):
 
     def __init__(self, model, mono2epoch, encoder='h264_nvenc', exposure_us=None,
                  gain=None, wb_temp=4600, auto_wb=True, auto_exposure=None,
-                 queue_size=32, qsize=256):
+                 imu=None, queue_size=32, qsize=256):
         super().__init__(qsize)
         m = WRIST_MODELS[model]
-        self.model, self.spec = model, m
+        self.model, self.spec, self.imu = model, m, imu
         self.size, self.fps, self.mono2epoch = m['size'], m['fps'], mono2epoch
         self.unit = m['exposure_unit_us']
         self.encoder = encoder
@@ -846,6 +851,8 @@ class WristRecorder(GatedRecorder):
             log.exception('wrist camera failed to start')
             self.q.put(None)
             return
+        if self.imu is not None:
+            self.imu.attach(prof, self.mono2epoch)
         try:
             while not self.stop_evt.is_set():
                 try:
@@ -875,6 +882,8 @@ class WristRecorder(GatedRecorder):
             self.err = f'wrist capture failed: {e}'
             log.exception('wrist capture thread died')
         finally:
+            if self.imu is not None:
+                self.imu.detach()          # the motion sensor before the pipeline
             try:
                 pipe.stop()
             except Exception:
@@ -1089,6 +1098,147 @@ class GripperRecorder:
         }
 
 
+# ----------------------------------------------------------------------- imu
+class ImuRecorder:
+    """The D455's gyro and accel, stamped on the wrist frames' clock and kept
+    only while armed.
+
+    On the motion sensor's own callback, not in the colour pipeline:
+    wait_for_frames pairs one IMU sample with each colour frame and drops the
+    rest (measured: 85 of 200 gyro samples a second). Opened on the started
+    pipeline's device, so the camera is still opened once -- see _configure.
+    """
+
+    STREAMS = ('gyro', 'accel')
+
+    def __init__(self):
+        self.err, self.live, self.written, self.armed = None, 0, 0, False
+        self.out_dir, self.sensor, self.extr = None, None, None
+        self.mono2epoch = 0.0
+        self.domains = set()
+        n = int(GRIPPER_TRACE_S * IMU_HZ * 1.5)
+        self.recent = {k: deque(maxlen=n) for k in self.STREAMS}
+        self.meter = {k: RateMeter(n=IMU_HZ) for k in self.STREAMS}
+        self.rows = {k: [] for k in self.STREAMS}
+        self.lock = threading.Lock()
+
+    def attach(self, prof, mono2epoch):
+        """Start gyro + accel at IMU_HZ on the wrist pipeline's device."""
+        self.mono2epoch = mono2epoch
+        try:
+            s = next((x for x in prof.get_device().query_sensors() if x.is_motion_sensor()),
+                     None)
+            if s is None:
+                raise RuntimeError('the wrist camera has no motion sensor')
+            want = {}
+            for p in s.get_stream_profiles():
+                if p.fps() == IMU_HZ and p.stream_type() in (rs.stream.gyro, rs.stream.accel):
+                    want.setdefault(p.stream_type(), p)
+            if len(want) < 2:
+                raise RuntimeError(f'no {IMU_HZ} Hz gyro and accel profiles')
+            e = prof.get_stream(rs.stream.color).get_extrinsics_to(want[rs.stream.gyro])
+            self.extr = (np.array(e.rotation, np.float64).reshape(3, 3),
+                         np.array(e.translation, np.float64))
+            s.open(list(want.values()))
+            s.start(self._on_frame)
+            self.sensor = s
+        except Exception as e:                       # noqa: BLE001
+            self.err = f'imu start failed: {e}'
+            log.exception('imu failed to start')
+
+    def detach(self):
+        s, self.sensor = self.sensor, None
+        if s is None:
+            return
+        for fn in (s.stop, s.close):
+            try:
+                fn()
+            except Exception:                        # noqa: BLE001
+                pass
+
+    def _on_frame(self, f):
+        """librealsense's thread: stamp, keep, nothing else."""
+        try:
+            k = 'gyro' if f.get_profile().stream_type() == rs.stream.gyro else 'accel'
+            v = f.as_motion_frame().get_motion_data()
+            t = int((f.get_timestamp() / 1000.0 - self.mono2epoch) * 1e9)
+            row = (t, v.x, v.y, v.z)
+            self.domains.add(f.get_frame_timestamp_domain())
+            self.recent[k].append(row)
+            self.meter[k].tick(t / 1e9)
+            self.live += 1
+            if self.armed:
+                with self.lock:
+                    if self.armed:
+                        self.rows[k].append(row)
+                        self.written += 1
+        except Exception as e:                       # noqa: BLE001
+            self.err = self.err or f'imu: {e}'
+
+    def arm(self, out_dir):
+        with self.lock:
+            self.out_dir, self.written = out_dir, 0
+            self.rows = {k: [] for k in self.STREAMS}
+            self.armed = True
+
+    def disarm(self):
+        with self.lock:
+            self.armed = False
+
+    def save(self):
+        """Written once, after disarm: a checkpoint would rebuild a growing array
+        under the GIL, next to the wrist's 11.1 ms deadline."""
+        with self.lock:
+            if self.out_dir is None:
+                return {}
+            rows = {k: list(v) for k, v in self.rows.items()}
+        arrays, out = {}, {}
+        for k, r in rows.items():
+            t = np.array([x[0] for x in r], np.int64)
+            arrays[f'{k}_t_ns'] = t
+            arrays[k] = np.array([x[1:] for x in r], np.float32).reshape(-1, 3)
+            out[k], out[f'{k}_hz'] = len(t), frame_rate(t)
+        R, tr = self.extr if self.extr is not None else (np.eye(3), np.zeros(3))
+        np.savez(os.path.join(self.out_dir, 'imu_ts.npz'), **arrays, rate_hz=IMU_HZ,
+                 color_to_imu_R=R, color_to_imu_t=tr)
+        return out
+
+    def state(self, trace_hz):
+        """Latest gyro (deg/s) and accel (m/s^2), plus the last GRIPPER_TRACE_S of
+        rotation speed: the peak per 1/trace_hz bin, so a quick flick still shows."""
+        now = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        g = np.array(list(self.recent['gyro']), np.float64).reshape(-1, 4)
+        acc = self.recent['accel'][-1] if self.recent['accel'] else None
+        trace = []
+        w = g[g[:, 0] >= now - GRIPPER_TRACE_S * 1e9]
+        if len(w):
+            speed = np.degrees(np.linalg.norm(w[:, 1:], axis=1))
+            b = ((w[:, 0] - w[0, 0]) * trace_hz // 1e9).astype(np.int64)
+            trace = np.round(np.maximum.reduceat(
+                speed, np.flatnonzero(np.diff(b, prepend=-1))), 1).tolist()
+        last = g[-1] if len(g) else None
+        return {
+            'speed_dps': None if last is None else round(float(np.degrees(np.linalg.norm(last[1:]))), 1),
+            'gyro_dps': None if last is None else np.round(np.degrees(last[1:]), 1).tolist(),
+            'accel': None if acc is None else [round(v, 2) for v in acc[1:]],
+            'gyro_hz': round(self.meter['gyro'].fps(), 1),
+            'accel_hz': round(self.meter['accel'].fps(), 1),
+            'age_s': None if last is None else round((now - last[0]) / 1e9, 2),
+            'stale_s': IMU_STALE, 'written': self.written, 'armed': self.armed, 'error': self.err,
+            'trace_hz': trace_hz, 'trace': trace,
+        }
+
+    def meta(self):
+        return {
+            'present': True, 'rate_hz': IMU_HZ, 'units': {'gyro': 'rad/s', 'accel': 'm/s^2'},
+            'axes': 'D455 IMU frame (librealsense)',
+            'intrinsics': 'factory identity: uncalibrated',
+            'color_to_imu': None if self.extr is None else {
+                'R': self.extr[0].round(6).tolist(), 't_m': self.extr[1].round(6).tolist()},
+            'timestamp_domains': sorted(str(d) for d in self.domains),
+        }
+
+
 # ------------------------------------------------------------------- session
 class RecordError(RuntimeError):
     """A refusal or a hardware failure. Raised rather than sys.exit so a server
@@ -1127,7 +1277,7 @@ class RecordSession:
             raise RecordError(f'gripper sensor {GRIPPER_DEVICE}: {e}') from None
 
         self.gripper.start()
-        self.recs = {}
+        self.recs, self.imu = {}, None
         try:
             self.stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.dir = os.path.join(os.path.abspath(out_root or os.path.join(DATA, 'capture')),
@@ -1150,12 +1300,16 @@ class RecordSession:
             if wrist:
                 # configured inside the recorder, on its own started pipeline -- never
                 # through a second handle from query_devices(). See _configure().
-                self.recs['wrist'] = WristRecorder(wrist_model(),
+                model = wrist_model()
+                if WRIST_MODELS[model]['imu']:
+                    self.imu = ImuRecorder()
+                self.recs['wrist'] = WristRecorder(model,
                                                    self.mono2epoch, ENCODER,
                                                    exposure_us=wrist_exposure_us,
                                                    gain=wrist_gain, wb_temp=wrist_wb,
                                                    auto_wb=wrist_auto_wb,
-                                                   auto_exposure=wrist_auto_exposure)
+                                                   auto_exposure=wrist_auto_exposure,
+                                                   imu=self.imu)
             for r in self.recs.values():
                 r.start()
         except BaseException:
@@ -1194,16 +1348,18 @@ class RecordSession:
         """
         t0 = time.time()
         while time.time() - t0 < timeout:
-            for k, r in [*self.recs.items(), ('gripper', self.gripper)]:
+            for k, r in self._streams():
                 if r.err:
                     raise RecordError(f'{k}: {r.err}')
-            if all(r.live > 0 for r in self.recs.values()) and self.gripper.live > 0 and (
+            if all(r.live > 0 for _, r in self._streams()) and (
                     'wrist' not in self.recs or self.recs['wrist'].settings):
                 return
             time.sleep(0.05)
         dead = [k for k, r in self.recs.items() if r.live == 0]
         if self.gripper.live == 0:
             dead.append(f'gripper (no lines from {GRIPPER_DEVICE}; is the sketch running?)')
+        if self.imu is not None and self.imu.live == 0:
+            dead.append('imu (no samples from the wrist camera)')
         raise RecordError(f'camera(s) delivered no frames within {timeout:.0f}s: '
                           + ', '.join(dead or ['(settings never arrived)']))
 
@@ -1221,6 +1377,13 @@ class RecordSession:
                 self._prep_ep(0)
 
     # ---------------------------------------------------------------- state
+    def _sensors(self):
+        """The streams armed around the cameras: the gripper, and the IMU if any."""
+        return [('gripper', self.gripper), *([('imu', self.imu)] if self.imu else [])]
+
+    def _streams(self):
+        return [*self.recs.items(), *self._sensors()]
+
     def ep_dir(self, i, cam=None):
         """The ONE place an episode path is composed.
 
@@ -1246,6 +1409,7 @@ class RecordSession:
     def state(self):
         """The SSE payload. elapsed_s is computed HERE, not in the browser:
         CLOCK_MONOTONIC is a ~475000 s number that means nothing to JS."""
+        trace_hz = GRIPPER_TRACE_REC_HZ if self.recording else GRIPPER_TRACE_HZ
         return {
             'session': self.stamp, 'session_dir': self.dir,
             'cams': list(self.recs),
@@ -1259,8 +1423,8 @@ class RecordSession:
                             'armed': r.armed, 'error': r.err}
                         for k, r in self.recs.items()},
             # trace rate follows the wrist preview: 10 Hz idle, 4 Hz recording
-            'gripper': self.gripper.state(GRIPPER_TRACE_REC_HZ if self.recording
-                                          else GRIPPER_TRACE_HZ),
+            'gripper': self.gripper.state(trace_hz),
+            'imu': self.imu.state(trace_hz) if self.imu else None,
         }
 
     # --------------------------------------------------------------- controls
@@ -1296,7 +1460,8 @@ class RecordSession:
         for k, r in self.recs.items():
             os.makedirs(self.ep_dir(i, k), exist_ok=True)
             r.prepare(self.ep_dir(i, k))
-        os.makedirs(self.ep_dir(i, 'gripper'), exist_ok=True)
+        for k, _ in self._sensors():
+            os.makedirs(self.ep_dir(i, k), exist_ok=True)
         self._prepared.add(i)
 
     def start_episode(self):
@@ -1311,12 +1476,13 @@ class RecordSession:
             self.transition = 'arming'
             i = self.ep_i
             try:
-                for k in [*self.recs, 'gripper']:
+                for k, _ in self._streams():
                     os.makedirs(self.ep_dir(i, k), exist_ok=True)
-                # scene and gripper lead so every wrist frame is bracketed by
-                # poses and openings. Shortening or inverting this leaves the
-                # episode's edge frames unlabelled -- see LEAD.
-                self.gripper.arm(self.ep_dir(i, 'gripper'))
+                # scene, gripper and imu lead so every wrist frame is bracketed by
+                # poses, openings and imu samples. Shortening or inverting this
+                # leaves the episode's edge frames unlabelled -- see LEAD.
+                for k, r in self._sensors():
+                    r.arm(self.ep_dir(i, k))
                 if 'scene' in self.recs:
                     self.recs['scene'].arm(self.ep_dir(i, 'scene'))
                     time.sleep(LEAD)
@@ -1341,7 +1507,8 @@ class RecordSession:
                     time.sleep(LEAD)
                 if 'scene' in self.recs:
                     self.recs['scene'].disarm()
-                self.gripper.disarm()
+                for _, r in self._sensors():
+                    r.disarm()
                 # Not padding: save() reads the row lists from THIS thread while
                 # the writer thread may still be draining its queue toward DISARM.
                 time.sleep(0.4)
@@ -1353,6 +1520,8 @@ class RecordSession:
                 n, hz = self.gripper.save()
                 ep['gripper'] = {'samples': n, 'hz': hz, 'bad': self.gripper.bad,
                                  'late': self.gripper.late - self.gripper.late_at_arm}
+                if self.imu:
+                    ep['imu'] = self.imu.save()
                 self.episodes.append(ep)
                 self.recording = False
                 self.ep_i = i + 1
@@ -1429,8 +1598,9 @@ class RecordSession:
                          'max_width_m': GRIPPER_MAX_WIDTH,
                          'format': '<opening raw>_<force raw> per line',
                          'bad_lines': self.gripper.bad, 'late_lines': self.gripper.late},
+             'imu': self.imu.meta() if self.imu else {'present': False},
              'episodes': self.episodes}
-        for k, r in [*self.recs.items(), ('gripper', self.gripper)]:
+        for k, r in self._streams():
             if r.err:
                 m[k]['error'] = r.err
         return m
@@ -1665,11 +1835,17 @@ def main():
                        disp_meter.fps(), grip_text())
 
     def grip_text():
-        g = sess.gripper
+        g, m = sess.gripper, sess.imu
         if g.err:
             return f'gripper ERROR {g.err}'
         w = g.width(g.latest[1]) * 1000 if g.latest else float('nan')
-        return f'gripper {w:5.1f} mm  {g.meter.fps():4.1f} Hz'
+        s = f'gripper {w:5.1f} mm  {g.meter.fps():4.1f} Hz'
+        if m is not None:
+            last = m.recent['gyro'][-1] if m.recent['gyro'] else None
+            v = np.degrees(np.linalg.norm(last[1:])) if last else float('nan')
+            s += (f'   imu ERROR {m.err}' if m.err else
+                  f'   imu {v:5.1f} deg/s  {m.meter["gyro"].fps():5.1f} Hz')
+        return s
 
     def start_ep():
         print(f'\n>>> ep{sess.start_episode():03d} recording')

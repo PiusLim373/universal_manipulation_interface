@@ -1147,8 +1147,8 @@ async def capture_start(request):
         log_cap.exception('session failed to start')
         return json_err(400, str(e))
     SESSIONS[CAPTURE_KEY] = CapturePreview(sess)
-    log_cap.info('session %s started (%s+gripper) -> %s',
-                 sess.stamp, '+'.join(sess.recs), sess.dir)
+    log_cap.info('session %s started (%s) -> %s',
+                 sess.stamp, '+'.join(k for k, _ in sess._streams()), sess.dir)
     st = SESSIONS[CAPTURE_KEY].state()
     st['ok'] = True
     return web.json_response(st)

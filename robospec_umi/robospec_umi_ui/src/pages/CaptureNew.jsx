@@ -4,6 +4,7 @@ import { Eye, Video, Check, Circle, Square, Loader2, AlertTriangle, Copy } from 
 import Page from '@/components/Page'
 import CameraStream from '@/components/CameraStream'
 import GripperReadout from '@/components/GripperReadout'
+import ImuReadout from '@/components/ImuReadout'
 import CameraBusy from '@/components/CameraBusy'
 import PreviewLock from '@/components/PreviewLock'
 import Stepper from '@/components/Stepper'
@@ -207,6 +208,7 @@ function RecordStage({ onFinished }) {
           ))}
         </div>
         <GripperReadout g={s?.gripper} recording={s?.recording} />
+        <ImuReadout m={s?.imu} recording={s?.recording} />
         {err && <p className="text-sm text-destructive shrink-0">{err}</p>}
         {camErr.map((m) => (
           <p key={m} className="text-sm text-destructive shrink-0 flex items-center gap-1.5">
@@ -264,9 +266,10 @@ function RecordStage({ onFinished }) {
                   {e.duration_s?.toFixed(1)}s
                 </span>
               </div>
-              <div className="text-muted-foreground tabular-nums">
+              {/* wraps between items, never inside one */}
+              <div className="text-muted-foreground tabular-nums flex flex-wrap gap-x-3 [&>span]:whitespace-nowrap">
                 {['scene', 'wrist'].filter((k) => e[k]).map((k) => (
-                  <span key={k} className="mr-3">
+                  <span key={k}>
                     {k} {e[k].frames} @ {e[k].fps.toFixed(1)}
                     {e[k].queue_drops > 0 && (
                       <span className="text-[#f59e0b]"> ·{e[k].queue_drops} dropped</span>
@@ -274,6 +277,7 @@ function RecordStage({ onFinished }) {
                   </span>
                 ))}
                 {e.gripper && <span>gripper {e.gripper.samples} @ {e.gripper.hz.toFixed(1)}</span>}
+                {e.imu && <span>imu {e.imu.gyro} @ {e.imu.gyro_hz.toFixed(1)}</span>}
               </div>
             </div>
           ))}
@@ -338,7 +342,8 @@ export default function CaptureNew() {
         // AWAIT the refresh before navigating. Firing it and calling nav() in
         // the same tick means the guard above re-runs against the stale
         // progress, sees active:false, and redirects straight back here.
-        <PreviewLock endpoints={CAPTURE_PREVIEW} aside={(st) => <GripperReadout g={st?.gripper} />}
+        <PreviewLock endpoints={CAPTURE_PREVIEW}
+                     aside={(st) => <><GripperReadout g={st?.gripper} /><ImuReadout m={st?.imu} /></>}
                      onDone={async () => {
           try {
             setProgress(await api.captureInfo())

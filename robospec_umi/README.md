@@ -368,6 +368,12 @@ becomes `robot0_gripper_width` in metres: linear, raw 0 → 0 m, raw 1146 → 0.
 (`GRIPPER_RAW_OPEN` / `GRIPPER_MAX_WIDTH` in `capture.py`, saved in each file). Both
 capture stages show it live. Sessions recorded before the gripper fail verify.
 
+**The D455's IMU is recorded too**, into `imu/imu_ts.npz`: gyro (rad/s) and accel
+(m/s²) at 200 Hz, each with its own `t_ns` on the same clock, plus the factory
+colour→IMU extrinsic. It is not processed yet. Its intrinsics are uncalibrated
+(factory identity). A D455 session will not start if the IMU does not; a D405 has
+none. Both capture stages show it live.
+
 **The preview is deliberately lossy.** It samples the stream and skips frames on
 purpose so recording never waits on the display. A large on-screen `skipped`
 count is correct, not a problem.
