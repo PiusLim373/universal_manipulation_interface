@@ -55,7 +55,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The same yaml the host uses, unmodified, so the container and the host are the
 # same environment. micromamba rather than full conda: identical result off the
 # same file, about a gigabyte smaller and a much faster solve.
-ENV MAMBA_ROOT_PREFIX=/opt/conda
+ENV MAMBA_ROOT_PREFIX=/opt/conda \
+    # pip section of the yaml: tolerate slow PyPI downloads
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
 COPY robospec_umi/robospec_umi_conda.yaml /tmp/env.yaml
 # The cache purge must be in THIS layer: a later `rm` cannot shrink an image,
 # it only adds a whiteout. Worth ~800 MB -- less than `du` on pkgs/ suggests,

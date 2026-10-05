@@ -22,7 +22,7 @@ services:
         # suit a first human account; override only if `id -u` is not 1000.
         UID: "${ROBOSPEC_UID:-1000}"
         GID: "${ROBOSPEC_GID:-1000}"
-    image: robospec-umi:latest
+    image: robospec-umi:oct_2026
     container_name: robospec_umi
 
     # The cameras need real device access: V4L2 ioctls for the scene camera, and
