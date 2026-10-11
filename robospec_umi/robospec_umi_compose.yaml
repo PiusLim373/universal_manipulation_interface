@@ -42,6 +42,7 @@ services:
       - /dev:/dev
       # cv2.imshow draws on the host's X server through this socket.
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - /etc/localtime:/etc/localtime:ro
       # The whole repo, so code edits are live and data/ writes land on the host.
       - ${ROBOSPEC_UMI_DIRECTORY}:/workspace
       # The UI again, separately, so it can be relocated outside the repo without
