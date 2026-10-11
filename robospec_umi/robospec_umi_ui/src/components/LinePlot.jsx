@@ -21,13 +21,17 @@ const fmt = (v, d) => (v == null ? '—' : v.toFixed(d))
  *
  * series: [{name, color, values}], values aligned with t (null = no data).
  * range: [lo, hi] to fix the y-axis; otherwise it fits the data, at least minSpan.
+ * stubs / highlight: extra polylines on their own times, [{color, pts: [[t, v]]}],
+ * drawn faint and dashed under the series / bold over them.
  */
 export default function LinePlot({ label, unit, t, series, duration, time, trim,
-                                   range, minSpan = 1, digits = 1, className = '', right = null }) {
-  const { paths, lo, hi } = useMemo(() => {
+                                   range, minSpan = 1, digits = 1, className = '', right = null,
+                                   stubs = null, highlight = null }) {
+  const { paths, stubPath, lo, hi } = useMemo(() => {
     let lo = range?.[0], hi = range?.[1]
     if (!range) {
-      const all = series.flatMap((s) => s.values.filter((v) => v != null))
+      const all = [...series.flatMap((s) => s.values.filter((v) => v != null)),
+                   ...(stubs || []).flatMap((s) => s.pts.map((p) => p[1]).filter((v) => v != null))]
       lo = all.length ? Math.min(...all) : 0
       hi = all.length ? Math.max(...all) : minSpan
       const pad = Math.max((hi - lo) * 0.08, (minSpan - (hi - lo)) / 2, 0)
@@ -45,8 +49,11 @@ export default function LinePlot({ label, unit, t, series, duration, time, trim,
       })
       return d
     })
-    return { paths, lo, hi }
-  }, [t, series, duration, range, minSpan])
+    const stubPath = (pts) => pts.filter((p) => p[1] != null)
+      .map(([tt, v], k) => `${k ? 'L' : 'M'}${px(tt).toFixed(1)} ${py(v).toFixed(1)}`).join('')
+    return { paths, stubPath, lo, hi }
+  }, [t, series, duration, range, minSpan, stubs])
+  const stubPaths = useMemo(() => (stubs || []).map((s) => stubPath(s.pts)), [stubs, stubPath])
 
   const i = at(t, time)
   const x = (v) => (v / duration) * W
@@ -74,9 +81,17 @@ export default function LinePlot({ label, unit, t, series, duration, time, trim,
         <svg className="absolute inset-0 w-full h-full" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
           {tin != null && <rect x={0} y={0} width={x(tin)} height={H} fill="#000" opacity={0.6} />}
           {tout != null && <rect x={x(tout)} y={0} width={W - x(tout)} height={H} fill="#000" opacity={0.6} />}
+          {stubPaths.map((d, k) => (
+            <path key={`s${k}`} d={d} fill="none" stroke={stubs[k].color} strokeWidth={1}
+                  strokeDasharray="3 3" opacity={0.5} vectorEffect="non-scaling-stroke" />
+          ))}
           {paths.map((d, k) => (
             <path key={k} d={d} fill="none" stroke={series[k].color} strokeWidth={1.5}
                   vectorEffect="non-scaling-stroke" />
+          ))}
+          {(highlight || []).map((s, k) => (
+            <path key={`h${k}`} d={stubPath(s.pts)} fill="none" stroke={s.color} strokeWidth={2.5}
+                  strokeDasharray="6 3" vectorEffect="non-scaling-stroke" />
           ))}
           <line x1={x(time)} x2={x(time)} y1={0} y2={H} stroke="#fff" strokeWidth={1}
                 vectorEffect="non-scaling-stroke" />

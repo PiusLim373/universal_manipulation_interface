@@ -6,7 +6,8 @@ import CalibrationTest from '@/pages/CalibrationTest'
 import CaptureNew from '@/pages/CaptureNew'
 import Edit from '@/pages/Edit'
 import EditProject from '@/pages/EditProject'
-import Placeholder from '@/pages/Placeholder'
+import Evaluation from '@/pages/Evaluation'
+import EvalWithoutRobot from '@/pages/EvalWithoutRobot'
 import Training from '@/pages/Training'
 
 // Real routes rather than a useState switch: a calibration capture session lives
@@ -29,10 +30,8 @@ export default function App() {
         <Route path="/edit/:pid" element={<Navigate to="select" replace />} />
         <Route path="/edit/:pid/:stage" element={<EditProject />} />
         <Route path="/training" element={<Training />} />
-        <Route path="/evaluation" element={
-          <Placeholder title="Evaluation"
-            blurb="Score a checkpoint against recorded data, with no robot attached."
-            cli={'python robospec_umi/robospec_umi_evaluation/eval_without_robot.py'} />} />
+        <Route path="/evaluation" element={<Evaluation />} />
+        <Route path="/evaluation/offline" element={<EvalWithoutRobot />} />
 
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

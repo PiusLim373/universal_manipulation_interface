@@ -85,6 +85,13 @@ def pose6(T):
     return np.concatenate([T[:3, 3], cv2.Rodrigues(T[:3, :3])[0].flatten()])
 
 
+def rpy_deg(R):
+    """(n,3,3) -> (n,3) extrinsic XYZ roll/pitch/yaw in degrees, as the graphs show."""
+    return np.degrees(np.stack([np.arctan2(R[:, 2, 1], R[:, 2, 2]),
+                                np.arcsin(np.clip(-R[:, 2, 0], -1, 1)),
+                                np.arctan2(R[:, 1, 0], R[:, 0, 0])], 1))
+
+
 # ------------------------------------------------------------- pose track
 def drop_spikes(pose_t, poses, thresh):
     """Remove isolated out-and-back excursions (planar PnP depth flips).

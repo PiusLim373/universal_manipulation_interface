@@ -18,7 +18,8 @@ const FEATURES = [
     desc: 'Generate the training command and download the checkpoints.',
     ready: true },
   { id: 'evaluation', to: '/evaluation', icon: FlaskConical, title: 'Evaluation',
-    desc: 'Score a checkpoint against recorded data, with no robot attached.' },
+    desc: 'Check a trained checkpoint against recordings, with or without the robot.',
+    ready: true },
 ]
 
 export default function Home() {

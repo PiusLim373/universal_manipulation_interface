@@ -1,595 +1,446 @@
-"""Run a trained UMI policy on recorded footage, with no robot attached.
+"""Run a trained UMI policy on a recording, with no robot attached.
 
-Feeds the policy real observations and compares the action chunk it predicts
-against what the hand actually did, so you can tell whether a checkpoint learned
-anything before committing hardware to finding out.
+The model is fed what it would get on the robot: the raw wrist video, cropped and
+resized exactly as for training, plus the TCP pose and gripper width at each
+step, built into its input by the robot-side helpers in
+umi/real_world/real_inference_util.py. At every observation step it forecasts
+the next 0.75 s. Each forecast is scored against what the hand actually did, and
+against standing still, and is saved for the Eval Without Robot page.
 
-    python3 robospec_umi/robospec_umi_evaluation/eval_without_robot.py
-    ... --no-video                     numbers only, skips the ~2 GB wrist decode
-    ... --log-samples 0 200            per-step delta tables for those samples
+    python3 robospec_umi/robospec_umi_evaluation/eval_without_robot.py \\
+        -c data/outputs/<date>/<run>/checkpoints/<epoch>.ckpt -e data/capture/<session>/ep003
 
-With no arguments it picks the newest checkpoint under data/outputs/, the newest
-dataset under data/dataset/, and ep000 of the newest session under data/capture/,
-announcing each choice. Results go to data/evaluation/<datetime>/.
+The checkpoint names the dataset it trained on, so the episode is labelled held
+out (never trained on), trained on, or not in that dataset; a trimmed episode is
+evaluated over exactly the span that went into the dataset. Results go to
+data/evaluation/<checkpoint>/<session>_<ep>.{json,npz}.
 
-
-HOW TO READ THE NUMBERS
------------------------
-The policy emits a (16, 10) chunk: 16 future steps of
-[3 position | 6D rotation | 1 gripper], expressed RELATIVE to the current pose --
-literally "move this far from where you are". Ground truth from the zarr has the
-same shape, so they subtract directly. Error is 3D Euclidean distance in mm.
-
-Three things decide whether that error means anything.
-
-1. THE NO-MOTION BASELINE. Because actions are relative, predicting all zeros --
-   "stay exactly where you are" -- already scores well when the hand moves
-   slowly. Its error equals the distance the hand actually moved, so it is
-   printed beside every result. A model that learned nothing still posts
-   flattering millimetre errors; only the ratio to this baseline is meaningful.
-
-2. TRAIN vs VAL. Reproducing training data proves the plumbing works and nothing
-   about generalisation. Results are split, and the gap between them is the
-   actual finding.
-
-3. PER HORIZON STEP, never a bare mean. Step 0 is degenerate -- the first action
-   is the current pose relative to itself, so true motion is 0.0 mm and the
-   baseline ratio is undefined. What matters is that the ratio RISES with
-   horizon: that is what separates predicting motion from predicting small
-   numbers.
-
-This is open loop. Ground truth is fed at every step, so errors never compound
-the way they will on a robot closing the loop on its own predictions. Read it as
-a lower bound on real error, never an estimate of it.
+Open loop: every forecast starts from the recorded pose, so errors never compound
+the way they will on a robot. Read the numbers as a lower bound.
 """
 
 import argparse
-import glob
+import hashlib
+import io
 import json
 import os
+import re
 import sys
-from datetime import datetime
+import time
+import zipfile
 
 import av
-import cv2
 import numpy as np
-import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # .../robospec_umi_evaluation
 PKG = os.path.dirname(HERE)                         # .../robospec_umi
 REPO = os.path.dirname(PKG)                         # repo root
 DATA = os.path.join(REPO, 'data')
+OUTPUTS = os.path.join(DATA, 'outputs')
+EVAL_ROOT = os.path.join(DATA, 'evaluation')
+CAPTURE_ROOT = os.path.join(DATA, 'capture')
+DATASET_ROOT = os.path.join(DATA, 'dataset')
+CALIB_JSON = os.path.join(DATA, 'calibration', 'scene_intrinsics.json')
 
 # The repo root carries diffusion_policy/ and umi/, which are not installed.
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(PKG, 'robospec_umi_dataset'))
 
-import dill                                                    # noqa: E402
-import hydra                                                   # noqa: E402
-from omegaconf import open_dict                                # noqa: E402
-from umi.common.cv_util import get_image_transform             # noqa: E402
-from umi.common.pose_util import pose10d_to_mat, mat_to_pose   # noqa: E402
-import timeline as TL                                          # noqa: E402
+import episode_prep as EP              # noqa: E402
+import timeline as TL                  # noqa: E402
+import video_processor_charuco as V    # noqa: E402
 
-# The 10-dim action for "do not move": zero translation, and the 6D rotation of
-# the identity matrix (its first two rows).
-IDENTITY10 = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0], dtype=np.float64)
-
-# ------------------------------------------------------------------- fixed run
-SPLIT = 'both'          # reporting train and val separately is the whole point
-MAX_SAMPLES = 200       # per split; inference is ~0.1 s each
-STRIDE = 1              # take consecutive samples
-INFERENCE_STEPS = 16    # DDIM steps
-VIDEO_FRAMES = 200      # frames in the annotated video
-VIDEO_FPS = 20.0
+BATCH = 16          # forecasts per forward pass
+POSE_TOL = 1e-5     # m; a recomputed pose must match the dataset's this closely
+N_CHECK = 6         # images per segment compared with the dataset's
 
 
-# --------------------------------------------------------------- input finding
-def _newest(paths):
-    return max(paths, key=os.path.getmtime) if paths else None
+# ------------------------------------------------------------- checkpoint info
+def read_cfg(ckpt):
+    """-> (cfg, {epoch, global_step}) without loading the weights: only data.pkl
+    is unpickled, with every tensor left out (0.06 s instead of ~5 s)."""
+    import dill
 
+    class Head(dill.Unpickler):
+        def persistent_load(self, pid):
+            return None
 
-def find_checkpoint():
-    """Newest *.ckpt anywhere under data/outputs/.
+        def find_class(self, mod, name):
+            if mod.startswith('torch'):
+                return lambda *a, **k: None
+            return super().find_class(mod, name)
 
-    Two layouts live there -- a bare file, and hydra's
-    <run>/checkpoints/<epoch>.ckpt -- so this globs recursively rather than
-    assuming either. Newest wins; pass -c for a specific epoch.
-    """
-    return _newest(glob.glob(os.path.join(DATA, 'outputs', '**', '*.ckpt'),
-                             recursive=True))
-
-
-def find_zarr():
-    """Newest *.zarr.zip, preferring data/dataset/ over data/ itself."""
-    return _newest(glob.glob(os.path.join(DATA, 'dataset', '*.zarr.zip'))
-                   or glob.glob(os.path.join(DATA, '*.zarr.zip')))
-
-
-def find_episode():
-    """ep000 of the newest capture session.
-
-    A guess, but a guarded one: the zarr records no link back to the recording it
-    was built from, and align_episode() below catches a mismatched pair by image
-    correlation rather than letting it through.
-    """
-    sessions = sorted(glob.glob(os.path.join(DATA, 'capture', '*')))
-    for s in reversed([d for d in sessions if os.path.isdir(d)]):
-        ep = os.path.join(s, 'ep000')
-        if os.path.isdir(ep):
-            return ep
-    return None
-
-
-# --------------------------------------------------------------------- loading
-def load_policy(ckpt, device, inference_steps):
-    """-> (policy, cfg, meta). The checkpoint is self-contained.
-
-    No normalizer file is needed: LinearNormalizer is an nn.Module held by the
-    policy, so its scale/offset tensors are already inside model.state_dict().
-    The normalizer.pkl that appears in a training run directory is a handshake
-    between ranks at train time, not an inference artefact.
-    """
-    from diffusion_policy.workspace.base_workspace import BaseWorkspace  # noqa: F401
-    payload = torch.load(open(ckpt, 'rb'), pickle_module=dill, map_location='cpu')
-    cfg = payload['cfg']
-    workspace = hydra.utils.get_class(cfg._target_)(cfg)
-    workspace.load_payload(payload)
-    # EMA weights are the ones validated during training and are NOT the same
-    # tensors as `model`. eval_real.py makes the same choice.
-    policy = workspace.ema_model if cfg.training.use_ema else workspace.model
-    policy.num_inference_steps = inference_steps
-    policy.eval().to(device)
-    meta = {k: dill.loads(v) for k, v in payload['pickles'].items()
+    with zipfile.ZipFile(ckpt) as z:
+        raw = z.read(next(n for n in z.namelist() if n.endswith('/data.pkl')))
+    p = Head(io.BytesIO(raw)).load()
+    meta = {k: dill.loads(v) for k, v in p.get('pickles', {}).items()
             if k in ('epoch', 'global_step')}
-    return policy, cfg, meta
+    return p['cfg'], meta
 
 
-def load_dataset(cfg, zarr_path):
-    """Instantiate UmiDataset against the zarr we were asked to evaluate.
+def describe(ckpt):
+    """What the checkpoint was trained on, and how that dataset was split.
 
-    cfg.task.dataset_path is baked into the checkpoint as whatever path training
-    ran against, which may not exist here and is almost certainly not the dataset
-    being evaluated. Left alone it would quietly read the wrong file, so it is
-    overridden before instantiation.
+    recordings: 'sess/epNNN' -> its segments in the dataset, each with the zarr
+    episode index and held_out. Episode i of the zarr is export.included[i] of
+    its project file, and the split is UmiDataset's own get_val_mask.
     """
-    with open_dict(cfg):
-        cfg.task.dataset_path = zarr_path
-        if 'dataset_path' in cfg.task.dataset:
-            cfg.task.dataset.dataset_path = zarr_path
-    dataset = hydra.utils.instantiate(cfg.task.dataset)
-    return dataset, dataset.get_validation_dataset()
+    from diffusion_policy.common.sampler import get_val_mask
+    cfg, meta = read_cfg(ckpt)
+    name = os.path.basename(str(cfg.task.dataset_path))
+    zarr_path = os.path.join(DATASET_ROOT, name)
+    m = re.match(r'^(\d{8}_\d{6})_dataset\.zarr\.zip$', name)
+    proj = None
+    if m and os.path.exists(os.path.join(DATASET_ROOT, f'{m.group(1)}_dataset.json')):
+        with open(os.path.join(DATASET_ROOT, f'{m.group(1)}_dataset.json')) as f:
+            proj = json.load(f)
+    included = ((proj or {}).get('export') or {}).get('included') or []
+    ds = cfg.task.dataset
+    val = get_val_mask(len(included), ds.val_ratio, ds.seed) if included else []
+    recordings = {}
+    for i, e in enumerate(included):
+        rec, _, seg = e['episode'].partition('_s')
+        recordings.setdefault(rec, []).append(
+            {'seg': int(seg or 0), 'steps': e['steps'], 'zarr_index': i, 'held_out': bool(val[i])})
+    a = cfg.task.shape_meta.action
+    return {'cfg': cfg, 'epoch': meta.get('epoch'), 'global_step': meta.get('global_step'),
+            'dataset': name, 'project': m and m.group(1), 'project_file': proj,
+            'zarr': zarr_path if os.path.exists(zarr_path) else None,
+            'recordings': recordings, 'horizon': int(a.horizon), 'down_sample': int(a.down_sample_steps),
+            'n_action_steps': cfg.get('n_action_steps'), 'run_dir': cfg.multi_run.run_dir}
 
 
-# ------------------------------------------------------------------ pose maths
-def action_pos_mm(a):
-    """(...,10) action -> (...,3) translation in mm.
-
-    Dims 3-8 are a 6D rotation (the first two rows of R); reading them directly
-    is meaningless, they have to go through pose10d_to_mat, which Gram-Schmidts
-    them back into a rotation matrix.
-    """
-    a = np.asarray(a, dtype=np.float64)
-    return mat_to_pose(pose10d_to_mat(a[..., :9]))[..., :3] * 1000.0
+def result_dir(ckpt):
+    """data/evaluation/<the name the Training page downloads the checkpoint as>."""
+    rel = os.path.relpath(os.path.realpath(ckpt), os.path.realpath(OUTPUTS))
+    if rel.startswith('..'):
+        rel = os.path.basename(ckpt)
+    name = rel.replace(os.sep + 'checkpoints' + os.sep, os.sep).replace(os.sep, '_')
+    return os.path.join(EVAL_ROOT, re.sub(r'\.ckpt$', '', name))
 
 
-def action_rot_deg(a):
-    """(...,10) action -> (...,3) rotation vector in degrees."""
-    a = np.asarray(a, dtype=np.float64)
-    return np.degrees(mat_to_pose(pose10d_to_mat(a[..., :9]))[..., 3:])
+def episode_key(ep_dir):
+    return os.path.relpath(os.path.abspath(ep_dir), CAPTURE_ROOT)
 
 
-def rot_mag(rotvec):
-    return np.linalg.norm(rotvec, axis=-1)
+def result_paths(ckpt, ep_dir):
+    stem = os.path.join(result_dir(ckpt), episode_key(ep_dir).replace(os.sep, '_'))
+    return stem + '.json', stem + '.npz'
 
 
-# -------------------------------------------------------------- video alignment
-def decode_wrist(mkv, out_res):
-    """Decode the whole wrist video, transformed exactly as build_zarr.py did.
+def read_result(ckpt, ep_dir):
+    try:
+        with open(result_paths(ckpt, ep_dir)[0]) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
-    Sequential decode, no seeking: h264 random access is unreliable, and the
-    whole clip is wanted anyway.
-    """
-    frames = []
-    with av.open(mkv) as c:
+
+# ------------------------------------------------------------------- inputs
+def wrist_frames(ep_dir, need, out_res):
+    """{frame index: image} for the frames needed, cropped and resized as
+    build_zarr does it. Sequential decode: h264 random access is unreliable."""
+    from umi.common.cv_util import get_image_transform
+    out, last = {}, max(need)
+    with av.open(os.path.join(ep_dir, 'wrist', 'wrist.mkv')) as c:
         st = c.streams.video[0]
         st.thread_count = 4
-        x0, side = TL.wrist_crop(st.width, st.height)
-        tf = get_image_transform((st.width, st.height), (out_res, out_res), crop_x=x0)
-        src = f'{st.width}x{st.height} crop x {x0}-{x0 + side}'
-        for f in c.decode(st):
-            frames.append(tf(f.to_ndarray(format='rgb24')))
-    return np.array(frames), src
-
-
-def signatures(imgs):
-    """16x16 mean-removed grayscale signatures, for correlation matching."""
-    s = np.stack([cv2.resize(x, (16, 16), interpolation=cv2.INTER_AREA).mean(axis=2)
-                  for x in imgs]).reshape(len(imgs), -1)
-    return (s - s.mean(1, keepdims=True)) / (s.std(1, keepdims=True) + 1e-6)
-
-
-def align_episode(video, replay_buffer, min_corr=0.99, max_pixel_diff=6.0):
-    """Match wrist video frames to zarr rows, per zarr episode. -> {ep: info}
-
-    The zarr records no link back to the recording it came from, so the mapping
-    has to be recovered. Re-deriving it through build_zarr.plan_episode would
-    mean importing that module AND the ChArUco processor and re-solving poses
-    that are already sitting in the zarr -- so instead the IMAGES are matched.
-    build_zarr wrote exactly these transformed frames into the zarr, so
-    correlation recovers the mapping directly.
-
-    Two independent checks guard it. Correlation must be near 1, and the match
-    must be MONOTONIC: both sequences are time-ordered, so a mapping that jumps
-    backwards is matching noise. Measured on the right episode this gives
-    corr 0.9999 and a 1.4/255 pixel residual (the lossy JpegXl round trip);
-    on a different recording, corr 0.54 and non-monotonic.
-    """
-    sv = signatures(video)
-    ends = replay_buffer.episode_ends[:]
-    out = {}
-    for i, end in enumerate(ends):
-        start = 0 if i == 0 else ends[i - 1]
-        z = replay_buffer['camera0_rgb'][start:end]
-        corr = signatures(z) @ sv.T / sv.shape[1]
-        idx, score = corr.argmax(1), corr.max(1)
-        diff = float(np.abs(z.astype(np.int16)
-                            - video[idx].astype(np.int16)).mean())
-        mono = bool(np.all(np.diff(idx) >= 0))
-        ok = score.min() >= min_corr and mono and diff <= max_pixel_diff
-        if ok:
-            out[i] = {'start': start, 'end': end, 'wrist_idx': idx,
-                      'corr': float(score.min()), 'diff': diff}
+        tf = get_image_transform((st.width, st.height), out_res,
+                                 crop_x=TL.wrist_crop(st.width, st.height)[0])
+        for i, f in enumerate(c.decode(st)):
+            if i in need:
+                out[i] = tf(f.to_ndarray(format='rgb24'))
+            if i >= last:
+                break
     return out
 
 
-# ---------------------------------------------------------------------- metrics
-class Metrics:
-    """Per-horizon-step error, against ground truth and against doing nothing."""
-
-    def __init__(self, horizon):
-        self.h = horizon
-        self.pos, self.rot, self.base_pos, self.base_rot = [], [], [], []
-
-    def add(self, pred, gt):
-        pp, gp = action_pos_mm(pred), action_pos_mm(gt)
-        pr, gr = action_rot_deg(pred), action_rot_deg(gt)
-        zp = action_pos_mm(np.tile(IDENTITY10, (self.h, 1)))
-        zr = action_rot_deg(np.tile(IDENTITY10, (self.h, 1)))
-        self.pos.append(np.linalg.norm(pp - gp, axis=-1))
-        self.rot.append(rot_mag(pr - gr))
-        # the no-motion baseline's error IS the distance the hand actually moved
-        self.base_pos.append(np.linalg.norm(zp - gp, axis=-1))
-        self.base_rot.append(rot_mag(zr - gr))
-
-    def empty(self):
-        return not self.pos
-
-    def report(self, label, rate=60.0, down_sample=3):
-        p, b = np.array(self.pos), np.array(self.base_pos)
-        r, br = np.array(self.rot), np.array(self.base_rot)
-        print(f'\n=== {label}   n={len(p)} samples x {p.shape[1]} horizon steps ===')
-        print(f'{"step":>5}{"t ahead":>9}{"true move":>11}{"model err":>11}'
-              f'{"gain":>7}   {"true rot":>10}{"rot err":>10}{"gain":>7}')
-        for s in list(range(0, p.shape[1], max(p.shape[1] // 4, 1))) + [p.shape[1] - 1]:
-            if s >= p.shape[1]:
-                continue
-            gp = b[:, s].mean() / max(p[:, s].mean(), 1e-9)
-            gr = br[:, s].mean() / max(r[:, s].mean(), 1e-9)
-            print(f'{s:>5}{(s + 1) * down_sample / rate:>8.2f}s'
-                  f'{b[:, s].mean():>11.1f}{p[:, s].mean():>11.1f}{gp:>6.2f}x   '
-                  f'{br[:, s].mean():>10.2f}{r[:, s].mean():>10.2f}{gr:>6.2f}x')
-        # step 0 is excluded from the headline: true motion there is 0.0 mm, so
-        # the ratio is undefined and averaging it in just dilutes the result
-        gain = b[:, 1:].mean() / max(p[:, 1:].mean(), 1e-9)
-        rgain = br[:, 1:].mean() / max(r[:, 1:].mean(), 1e-9)
-        print(f'{"MEAN":>5}{"":>9}{b[:, 1:].mean():>11.1f}{p[:, 1:].mean():>11.1f}'
-              f'{gain:>6.2f}x   {br[:, 1:].mean():>10.2f}{r[:, 1:].mean():>10.2f}'
-              f'{rgain:>6.2f}x   (step 0 excluded)')
-        return float(p[:, 1:].mean()), float(gain), float(rgain)
+def obs_index(i, horizon, down, pad):
+    """UmiDataset's history for grid step i: images repeat the first valid frame
+    (pad), low-dim clips at the segment start."""
+    if not pad:
+        return [max(i - k * down, 0) for k in reversed(range(horizon))]
+    n = min(horizon, i // down + 1)
+    idx = [i - k * down for k in reversed(range(n))]
+    return [idx[0]] * (horizon - n) + idx
 
 
-def log_sample(i, pred, gt, split):
-    """The literal 'what would the robot do next' readout."""
-    pp, gp = action_pos_mm(pred), action_pos_mm(gt)
-    pr, gr = action_rot_deg(pred), action_rot_deg(gt)
-    print(f'\n--- sample {i} [{split}] --- motion relative to the current pose')
-    print(f'{"step":>5}{"PRED dx":>9}{"dy":>8}{"dz":>8}{"|d|":>8}{"rot":>7}'
-          f'  |{"GT dx":>9}{"dy":>8}{"dz":>8}{"|d|":>8}{"rot":>7}{"err":>8}')
-    for s in range(len(pp)):
-        print(f'{s:>5}{pp[s][0]:>9.1f}{pp[s][1]:>8.1f}{pp[s][2]:>8.1f}'
-              f'{np.linalg.norm(pp[s]):>8.1f}{rot_mag(pr[s]):>7.1f}'
-              f'  |{gp[s][0]:>9.1f}{gp[s][1]:>8.1f}{gp[s][2]:>8.1f}'
-              f'{np.linalg.norm(gp[s]):>8.1f}{rot_mag(gr[s]):>7.1f}'
-              f'{np.linalg.norm(pp[s] - gp[s]):>8.1f}')
+def check_rows(n):
+    """The steps of a segment whose images are compared with the dataset's."""
+    return np.linspace(0, n - 1, N_CHECK).astype(int)
 
 
-# ------------------------------------------------------------------------ video
-def draw_panel(img_rgb, pred, gt, row, split, view_px=560, panel_px=430):
-    """Wrist frame beside the predicted-vs-actual motion for that frame.
+def check_dataset(info, key, segs, frames):
+    """Do the recomputed segments reproduce the dataset? -> verify dict.
 
-    The path is drawn as a top-down plot in the gripper's own XY plane rather
-    than projected into the image. Projecting would need the wrist camera's
-    intrinsics and its transform to the TCP, neither of which this rig has
-    measured -- inventing them would put a confident-looking overlay in the
-    wrong place, which is worse than an honest 2D plot.
+    Steps and poses must match the zarr exactly, or a trim changed since the
+    export. The raw-path images differ only by the zarr's lossy compression;
+    input_diff reports it in /255.
     """
-    view = cv2.cvtColor(cv2.resize(img_rgb, (view_px, view_px),
-                                   interpolation=cv2.INTER_LINEAR),
-                        cv2.COLOR_RGB2BGR)
-    pp, gp = action_pos_mm(pred), action_pos_mm(gt)
-    pr, gr = action_rot_deg(pred), action_rot_deg(gt)
-    panel = np.full((view_px, panel_px, 3), 26, np.uint8)
-    # cv2 is BGR: (120,200,255) reads as orange, not blue. Ground truth is drawn
-    # in a real blue so the legend does not lie about which line is which.
-    GREEN, BLUE, GREY = (120, 240, 120), (255, 190, 90), (150, 150, 150)
-
-    def put(t, y, col=(235, 235, 235), sc=0.5, th=1):
-        cv2.putText(panel, t, (12, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col, th,
-                    cv2.LINE_AA)
-
-    badge = (0, 200, 80) if split == 'TRAIN' else (40, 190, 245)
-    cv2.rectangle(panel, (12, 12), (108, 40), badge, -1)
-    cv2.putText(panel, split, (22, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (20, 20, 20), 2, cv2.LINE_AA)
-    cv2.putText(panel, f'zarr row {row}', (120, 33), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, GREY, 1, cv2.LINE_AA)
-    put('final step of the 16-step chunk (0.80 s ahead)', 62, GREY, 0.44)
-    put(f'PRED {pp[-1][0]:+7.1f}{pp[-1][1]:+7.1f}{pp[-1][2]:+7.1f} mm', 90, GREEN, 0.52)
-    put(f'     |d| {np.linalg.norm(pp[-1]):6.1f} mm  rot {rot_mag(pr[-1]):5.1f} deg',
-        112, GREEN, 0.48)
-    put(f'GT   {gp[-1][0]:+7.1f}{gp[-1][1]:+7.1f}{gp[-1][2]:+7.1f} mm', 142, BLUE, 0.52)
-    put(f'     |d| {np.linalg.norm(gp[-1]):6.1f} mm  rot {rot_mag(gr[-1]):5.1f} deg',
-        164, BLUE, 0.48)
-    err = float(np.linalg.norm(pp[-1] - gp[-1]))
-    put(f'error {err:6.1f} mm', 196,
-        GREEN if err < 20 else (60, 160, 255), 0.6, 2)
-
-    cx, cy, r = panel_px // 2, 400, 150
-    span = max(float(np.abs(np.concatenate([pp[:, :2], gp[:, :2]])).max()), 1.0)
-    cv2.line(panel, (cx - r, cy), (cx + r, cy), (70, 70, 70), 1)
-    cv2.line(panel, (cx, cy - r), (cx, cy + r), (70, 70, 70), 1)
-    put(f'top-down XY, +/-{span:.0f} mm   green=pred  blue=actual',
-        cy + r + 26, GREY, 0.42)
-    for pts, col in ((gp, BLUE), (pp, GREEN)):
-        xy = np.stack([cx + pts[:, 0] / span * r, cy - pts[:, 1] / span * r], 1)
-        cv2.polylines(panel, [xy.astype(np.int32)], False, col, 2, cv2.LINE_AA)
-        cv2.circle(panel, tuple(xy[-1].astype(int)), 4, col, -1)
-    cv2.circle(panel, (cx, cy), 3, (255, 255, 255), -1)
-    return np.hstack([view, panel])
+    mine = info['recordings'].get(key)
+    if mine is None:
+        return {'status': 'not in dataset'}
+    if len(mine) != len(segs) or any(m['steps'] != len(s['grid']) for m, s in zip(mine, segs)):
+        return {'status': 'mismatch', 'detail': 'segment steps differ from the export: '
+                'the dataset was exported with another trim'}
+    if info['zarr'] is None:
+        return {'status': 'steps only', 'detail': f'{info["dataset"]} is not here'}
+    import zarr
+    from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs
+    register_codecs()
+    z = zarr.open(info['zarr'], 'r')
+    ends = z['meta/episode_ends'][:]
+    pos, rot, grip = z['data/robot0_eef_pos'], z['data/robot0_eef_rot_axis_angle'], z['data/robot0_gripper_width']
+    diffs = []
+    for m, s in zip(mine, segs):
+        a, b = (ends[m['zarr_index'] - 1] if m['zarr_index'] else 0), ends[m['zarr_index']]
+        dp = max(np.abs(s['pose'][:, :3] - pos[a:b]).max(), np.abs(s['pose'][:, 3:] - rot[a:b]).max())
+        dg = np.abs(TL.gripper_on_grid(s['dir'], s['grid']) - grip[a:b]).max()
+        if dp > POSE_TOL or dg > POSE_TOL:
+            return {'status': 'mismatch', 'detail': f'poses differ from the export by {dp * 1000:.2f} mm: '
+                    're-prepped with another intrinsic or pipeline since'}
+        for k in check_rows(b - a):
+            diffs.append(np.abs(z['data/camera0_rgb'][a + k].astype(np.int16)
+                                - frames[int(s['wrist_idx'][k])].astype(np.int16)).mean())
+    return {'status': 'verified', 'input_diff': round(float(np.mean(diffs)), 2)}
 
 
-# ------------------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('-c', '--checkpoint', default=None,
-                    help='default: newest *.ckpt under data/outputs/')
-    ap.add_argument('-z', '--zarr', default=None,
-                    help='default: newest *.zarr.zip under data/dataset/')
-    ap.add_argument('-e', '--episode', default=None,
-                    help='default: ep000 of the newest data/capture/ session')
-    ap.add_argument('--no-video', action='store_true',
-                    help='skip decoding wrist.mkv entirely (pure zarr replay). '
-                         'Much faster when only the numbers are wanted.')
-    ap.add_argument('--log-samples', type=int, nargs='*', default=[],
-                    help='sample indices to print a full per-step delta table for')
-    args = ap.parse_args()
+# -------------------------------------------------------------------- model
+def load_policy(ckpt, device):
+    """-> (policy, cfg). Every weight comes from the checkpoint, so a ViT encoder
+    is built without its pretrained download (no BatchNorm, same architecture)."""
+    import dill
+    import hydra
+    import torch
+    from omegaconf import open_dict
+    payload = torch.load(open(ckpt, 'rb'), pickle_module=dill, map_location='cpu')
+    cfg = payload['cfg']
+    enc = cfg.policy.obs_encoder
+    if str(enc.get('model_name', '')).startswith('vit'):
+        with open_dict(cfg):
+            enc.pretrained = False
+    ws = hydra.utils.get_class(cfg._target_)(cfg)
+    ws.load_payload(payload)
+    policy = ws.ema_model if cfg.training.use_ema else ws.model
+    return policy.eval().to(device), cfg
 
-    # Each default is ANNOUNCED, never silently assumed: evaluating the wrong
-    # checkpoint or the wrong recording produces numbers that look entirely
-    # ordinary, and the mistake surfaces much later if at all.
-    for attr, finder, what in (('checkpoint', find_checkpoint, 'data/outputs/'),
-                               ('zarr', find_zarr, 'data/dataset/'),
-                               ('episode', find_episode, 'data/capture/')):
-        if getattr(args, attr) is None:
-            found = finder()
-            if found is None and attr != 'episode':
-                raise SystemExit(f'no {attr} found under {what} -- pass '
-                                 f'--{attr} explicitly')
-            setattr(args, attr, found)
-            if found:
-                print(f'{attr:<12}{found}  (newest in {what})')
 
-    for p in (args.checkpoint, args.zarr):
-        if not os.path.exists(p):
-            raise SystemExit(f'missing: {p}')
+def split_of(mine, si):
+    """held_out / trained_on for a segment of a dataset recording."""
+    if not mine:
+        return 'not_in_dataset'
+    return 'held_out' if mine[min(si, len(mine) - 1)]['held_out'] else 'trained_on'
 
-    out_dir = os.path.join(DATA, 'evaluation',
-                           datetime.now().strftime('%Y%m%d_%H%M%S'))
-    os.makedirs(out_dir, exist_ok=True)
 
+def angle_deg(Ra, Rb):
+    """Geodesic angle between rotation stacks, degrees."""
+    c = (np.einsum('nij,nij->n', Ra, Rb) - 1) / 2
+    return np.degrees(np.arccos(np.clip(c, -1, 1)))
+
+
+def stamp(ckpt, ep_dir, intr_path, seed, stride):
+    """What a result was made from; a cached one is reused only while it all matches."""
+    st = os.stat(ckpt)
+    with open(intr_path, 'rb') as f:
+        intr = hashlib.sha1(f.read()).hexdigest()
+    return {'checkpoint_size': st.st_size, 'checkpoint_mtime': int(st.st_mtime),
+            'prepared_at': (EP.read_prep(ep_dir) or {}).get('prepared_at'),
+            'intrinsics_sha1': intr, 'seed': seed, 'stride': stride}
+
+
+# ----------------------------------------------------------------- evaluate
+def evaluate(ckpt, ep_dir, intr_path=CALIB_JSON, seed=0, stride=None, force=False, progress=None):
+    """Forecast along one recording and score it. -> the result json dict."""
+    import torch
+    from diffusion_policy.common.pytorch_util import dict_apply
+    from umi.real_world.real_inference_util import get_real_umi_obs_dict, get_real_umi_action
+    from umi.common.pose_util import pose_to_mat
+
+    progress = progress or (lambda *a: None)
+    ep_dir, t_start = os.path.abspath(ep_dir), time.time()
+    key = episode_key(ep_dir)
+    info = describe(ckpt)
+    down, horizon = info['down_sample'], info['horizon']
+    stride = stride or down
+    EP.prepare(ep_dir, intr_path, progress, videos=False)    # a no-op once prepped
+    st = stamp(ckpt, ep_dir, intr_path, seed, stride)
+    old = read_result(ckpt, ep_dir)
+    if old and not force and old.get('stamp') == st:
+        return old
+
+    mine = info['recordings'].get(key)
+    proj = info['project_file'] or {}
+    trim = ((proj.get('episodes') or {}).get(key) or {}).get('trim') if mine else None
+    plan = TL.plan_episode(ep_dir, trim)
+    segs = plan['segments']
+    if not segs:
+        raise SystemExit(f'{key}: nothing to evaluate ({plan["reason"]})')
+    t0 = TL.load_track(ep_dir)['t_ns'][0] / 1e9
+
+    meta = info['cfg'].task.shape_meta
+    obs_meta = meta.obs
+    rgb = [k for k, v in obs_meta.items() if v.get('type') == 'rgb']
+    hr, dr = obs_meta[rgb[0]].horizon, obs_meta[rgb[0]].down_sample_steps
+    hl, dl = obs_meta['robot0_eef_pos'].horizon, obs_meta['robot0_eef_pos'].down_sample_steps
+    out_res = tuple(obs_meta[rgb[0]].shape[1:][::-1])
+    starts = [list(range(0, len(s['grid']), stride)) for s in segs]
+
+    progress('decode', 0, 1)
+    need = {int(s['wrist_idx'][j]) for s, st_ in zip(segs, starts)
+            for i in [*st_, *check_rows(len(s['grid']))] for j in obs_index(i, hr, dr, True)}
+    frames = wrist_frames(ep_dir, need, out_res)
+    verify = check_dataset(info, key, segs, frames)
+
+    progress('load', 0, 1)
+    t_load = time.time()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'device      {device}')
-    print(f'results     {out_dir}')
-    print(f'checkpoint  {args.checkpoint}')
-    policy, cfg, meta = load_policy(args.checkpoint, device, INFERENCE_STEPS)
-    print(f'            epoch {meta.get("epoch")}  step {meta.get("global_step")}  '
-          f'{"EMA" if cfg.training.use_ema else "raw"} weights  '
-          f'{INFERENCE_STEPS} DDIM steps')
-    print(f'zarr        {args.zarr}')
-    dataset, val = load_dataset(cfg, args.zarr)
-    horizon = cfg.task.shape_meta['action']['horizon']
-    down = cfg.task.shape_meta['action']['down_sample_steps']
-    print(f'            {len(dataset)} train / {len(val)} val samples, '
-          f'action horizon {horizon} at every {down}th 60 Hz step')
+    policy, cfg = load_policy(ckpt, device)
+    t_load = time.time() - t_load
+    repr_ = cfg.task.pose_repr
 
-    # ---- align the recorded video with the zarr rows ------------------------
-    aligned, video = {}, None
-    if not args.no_video and args.episode is None:
-        print('video       no session found under data/capture/; continuing on '
-              'zarr images only (pass -e for one)')
-    elif not args.no_video:
-        mkv = os.path.join(args.episode, 'wrist', 'wrist.mkv')
-        if not os.path.exists(mkv):
-            print(f'video       {mkv} not found; continuing on zarr images only')
-        else:
-            res = cfg.task.shape_meta['obs']['camera0_rgb']['shape'][1]
-            video, src = decode_wrist(mkv, res)
-            print(f'video       {mkv}')
-            print(f'            {len(video)} frames, {src} -> '
-                  f'{res}x{res}')
-            aligned = align_episode(video, dataset.replay_buffer)
-            if not aligned:
-                print('            NO zarr episode matches this video. Either it is '
-                      'not the recording this zarr was built from, or build_zarr '
-                      'settings changed since. Falling back to zarr images.')
-            for i, a in sorted(aligned.items()):
-                print(f'            zarr episode {i} rows {a["start"]}:{a["end"]} '
-                      f'<- wrist frames {a["wrist_idx"][0]}..{a["wrist_idx"][-1]}  '
-                      f'corr {a["corr"]:.4f}  |video-zarr| {a["diff"]:.2f}/255')
-            if aligned and max(a['diff'] for a in aligned.values()) > 3.0:
-                print('            WARNING: the video path does not reproduce the '
-                      'zarr images closely. A deployed policy would see different '
-                      'pixels than this model trained on.')
+    with av.open(os.path.join(ep_dir, 'scene', 'scene.mkv')) as c:
+        size = (c.streams.video[0].width, c.streams.video[0].height)
+    cam = V.load_intrinsics(intr_path, *size)
 
-    # row -> decoded frame, for --video-images and for the annotated video
-    row_img = {}
-    for a in aligned.values():
-        for k, w in enumerate(a['wrist_idx']):
-            row_img[a['start'] + k] = video[int(w)]
+    def px(p):
+        q, good = cam.project(p, np.zeros(3), np.zeros(3))
+        q[~good] = np.nan
+        return q
 
-    # ---- run the policy ----------------------------------------------------
-    results = {}
-    for name, ds in (('train', dataset), ('val', val)):
-        if SPLIT not in (name, 'both') or len(ds) == 0:
-            continue
-        idxs = list(range(0, len(ds), max(STRIDE, 1)))[:MAX_SAMPLES]
-        m, logged = Metrics(horizon), []
-        with torch.no_grad():
-            for i in idxs:
-                batch = ds[i]
-                obs = {k: v.unsqueeze(0).to(device) for k, v in batch['obs'].items()}
-                pred = policy.predict_action(obs)['action_pred'][0].cpu().numpy()
-                gt = batch['action'].numpy()
-                m.add(pred, gt)
-                if i in args.log_samples:
-                    logged.append((i, pred, gt))
-        for i, pred, gt in logged:
-            log_sample(i, pred, gt, name)
-        if not m.empty():
-            results[name] = m.report(f'{name} split', down_sample=down)
-
-    # ---- verdict -----------------------------------------------------------
-    print('\n' + '=' * 74)
-    if 'train' in results and 'val' in results:
-        tp, tg, _ = results['train']
-        vp, vg, _ = results['val']
-        print(f'position:  train {tp:.1f} mm ({tg:.2f}x baseline)    '
-              f'val {vp:.1f} mm ({vg:.2f}x baseline)')
-        if vg < 1.2:
-            print('The model barely beats predicting no motion on held-out data. '
-                  'It has not learned a useful policy yet.')
-        elif vp > tp * 1.6:
-            print('Held-out error is well above training error: the model is '
-                  'fitting these specific demonstrations rather than the task. '
-                  'Expected at this dataset size -- the fix is more data, not '
-                  'more epochs.')
-        else:
-            print('Held-out error is close to training error and clearly beats the '
-                  'no-motion baseline, which is what generalisation looks like.')
-
-    # Rotation is scored separately because it can fail while position succeeds,
-    # and the position headline would hide it completely. A gain below 1.0 means
-    # the predicted rotation is further from the truth than predicting NO
-    # rotation would have been -- the model is actively making it worse.
-    for name, (_, _, rgain) in results.items():
-        if rgain < 1.0:
-            print(f'ROTATION [{name}]: {rgain:.2f}x baseline -- WORSE than '
-                  f'predicting no rotation at all. The position head is learning '
-                  f'and the rotation head is not.')
-        elif rgain < 1.2:
-            print(f'rotation [{name}]: {rgain:.2f}x baseline -- barely better than '
-                  f'no rotation.')
-    for name, (p, g, _) in results.items():
-        if g < 1.2:
-            print(f'  {name}: position {g:.2f}x baseline -- at or below '
-                  f'"stay still".')
-    print('\nCaveats this measurement cannot escape:')
-    print('  * Open loop. Ground truth is fed at every step, so errors never '
-          'compound\n    as they will on a robot. This is a lower bound on real '
-          'error.')
-    print('  * robot0_gripper_width is constant 0.0 in this dataset, so that '
-          'input\n    channel carries no information and the gripper action is '
-          'not meaningful.')
-    if len(val):
-        print(f'  * val is {len(val)} samples from a single held-out segment. '
-              f'It is the only\n    held-out data that exists here; one segment '
-              f'is not a distribution.')
-    print('=' * 74)
-
-    # ---- summary.json ------------------------------------------------------
-    # Written so two checkpoints can be compared without re-reading scrollback.
-    # The gains matter more than the millimetres: because actions are relative,
-    # raw error is flattering whenever the hand moved slowly.
-    summary = {
-        'checkpoint': args.checkpoint,
-        'epoch': meta.get('epoch'),
-        'global_step': meta.get('global_step'),
-        'zarr': args.zarr,
-        'episode': args.episode,
-        'inference_steps': INFERENCE_STEPS,
-        'n_train_samples': len(dataset),
-        'n_val_samples': len(val),
-        'splits': {name: {'pos_err_mm': p, 'pos_gain': g, 'rot_gain': rg}
-                   for name, (p, g, rg) in results.items()},
-    }
-    with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
-        json.dump(summary, f, indent=2)
-    print(f'wrote {os.path.join(out_dir, "summary.json")}')
-
-    # ---- annotated video ---------------------------------------------------
-    video_path = os.path.join(out_dir, 'eval_annotated.mp4')
-    if row_img:
-        val_rows = set()
-        for i in range(len(val)):
-            val_rows.add(int(val.sampler.indices[i][0]))
-        rows = {int(dataset.sampler.indices[i][0]): (i, dataset)
-                for i in range(len(dataset))}
-        rows.update({int(val.sampler.indices[i][0]): (i, val)
-                     for i in range(len(val))})
-        # Spread evenly over every matched row rather than taking the first N: a
-        # prefix biases the video toward whichever split happens to come first in
-        # the episode, and the train/val comparison is the point of it.
-        #
-        # Whether any VAL frames appear at all depends on the episode passed to
-        # -e. UmiDataset holds out whole zarr episodes, so a video of ep000 shows
-        # val frames only when ep000 is itself the held-out one. That is reported
-        # below rather than left to be inferred from a "0 val" count.
-        allrows = sorted(r for r in row_img if r in rows)
-        if len(allrows) > VIDEO_FRAMES:
-            pick = np.linspace(0, len(allrows) - 1, VIDEO_FRAMES)
-            allrows = [allrows[int(round(i))] for i in pick]
-        avail = allrows
-        if not avail:
-            print('\nno overlap between decoded frames and dataset samples; '
-                  'skipping video')
-        else:
-            writer = None
+    torch.manual_seed(seed)
+    total, done = sum(map(len, starts)), 0
+    F = {k: [] for k in ('seg', 'i', 't', 'xyz', 'rpy', 'grip', 'px')}
+    grid = {k: [] for k in ('t', 'seg', 'px')}
+    scores = {}
+    t_inf = time.time()
+    for si, (s, st_) in enumerate(zip(segs, starts)):
+        pose, n = s['pose'].astype(np.float64), len(s['grid'])
+        grip = TL.gripper_on_grid(s['dir'], s['grid'])[:, 0].astype(np.float64)
+        R = pose_to_mat(pose)[:, :3, :3]
+        grid['t'].append(s['grid'] - t0)
+        grid['seg'].append(np.full(n, si))
+        grid['px'].append(px(pose[:, :3]))
+        split = split_of(mine, si)
+        sc = scores.setdefault(split, {'n': 0, 'err': {}, 'still': {}})
+        for b0 in range(0, len(st_), BATCH):
+            batch, envs = [], []
+            for i in st_[b0:b0 + BATCH]:
+                li = obs_index(i, hl, dl, False)
+                env = {rgb[0]: np.stack([frames[int(s['wrist_idx'][j])] for j in obs_index(i, hr, dr, True)]),
+                       'robot0_eef_pos': pose[li, :3], 'robot0_eef_rot_axis_angle': pose[li, 3:],
+                       'robot0_gripper_width': grip[li, None]}
+                envs.append(env)
+                batch.append(get_real_umi_obs_dict(env, meta, repr_.obs_pose_repr,
+                                                   episode_start_pose=[s['demo_start'].astype(np.float64)]))
+            obs = {k: np.stack([b[k] for b in batch]) for k in batch[0]}
             with torch.no_grad():
-                for r in avail:
-                    si, ds = rows[r]
-                    batch = ds[si]
-                    obs = {k: v.unsqueeze(0).to(device)
-                           for k, v in batch['obs'].items()}
-                    pred = policy.predict_action(obs)['action_pred'][0].cpu().numpy()
-                    frame = draw_panel(row_img[r], pred, batch['action'].numpy(), r,
-                                       'VAL' if r in val_rows else 'TRAIN')
-                    if writer is None:
-                        writer = cv2.VideoWriter(
-                            video_path, cv2.VideoWriter_fourcc(*'mp4v'),
-                            VIDEO_FPS, (frame.shape[1], frame.shape[0]))
-                    writer.write(frame)
-            if writer is not None:
-                writer.release()
-                n_val = sum(1 for r in avail if r in val_rows)
-                print(f'wrote {video_path}  {len(avail)} frames '
-                      f'({len(avail) - n_val} train, {n_val} val)')
-                if n_val == 0:
-                    print(f'            all TRAIN: the held-out split is in a '
-                          f'different zarr episode than\n            '
-                          f'{os.path.basename(args.episode)}. Point -e at the '
-                          f'held-out episode to see VAL frames.')
+                raw = policy.predict_action(dict_apply(
+                    obs, lambda x: torch.as_tensor(x, dtype=torch.float32).to(device)))['action_pred']
+            raw = raw.cpu().numpy()
+            for i, env, r in zip(st_[b0:b0 + BATCH], envs, raw):
+                a = get_real_umi_action(r, env, repr_.action_pose_repr)     # (H, 7) absolute
+                Ra = pose_to_mat(a[:, :6])[:, :3, :3]
+                F['seg'].append(si)
+                F['i'].append(i)
+                F['t'].append(s['grid'][i] - t0)
+                F['xyz'].append(a[:, :3] * 1000)
+                F['rpy'].append(np.degrees(np.unwrap(np.radians(TL.rpy_deg(Ra)), axis=0)))
+                F['grip'].append(a[:, 6] * 1000)
+                F['px'].append(px(a[:, :3]))
+                sc['n'] += 1
+                for k in range(1, horizon):
+                    j = i + k * down
+                    if j >= n:
+                        break
+                    e = sc['err'].setdefault(k, [[], [], []])
+                    w = sc['still'].setdefault(k, [[], [], []])
+                    e[0].append(np.linalg.norm(a[k, :3] - pose[j, :3]) * 1000)
+                    w[0].append(np.linalg.norm(pose[i, :3] - pose[j, :3]) * 1000)
+                    e[1].append(angle_deg(Ra[k:k + 1], R[j:j + 1])[0])
+                    w[1].append(angle_deg(R[i:i + 1], R[j:j + 1])[0])
+                    e[2].append(abs(a[k, 6] - grip[j]) * 1000)
+                    w[2].append(abs(grip[i] - grip[j]) * 1000)
+            done += len(batch)
+            progress('forecast', done, total)
+    t_inf = time.time() - t_inf
+
+    hz = TL.GRID_HZ
+    metrics = {}
+    for split, sc in scores.items():
+        ahead = []
+        for k in sorted(sc['err']):
+            e, w = (np.mean(x, axis=1) for x in (sc['err'][k], sc['still'][k]))
+            ahead.append({'step': k, 's': round(k * down / hz, 3), 'n': len(sc['err'][k][0]),
+                          'pos_mm': round(e[0], 2), 'pos_still_mm': round(w[0], 2),
+                          'rot_deg': round(e[1], 2), 'rot_still_deg': round(w[1], 2),
+                          'grip_mm': round(e[2], 2), 'grip_still_mm': round(w[2], 2)})
+        metrics[split] = {'forecasts': sc['n'], 'ahead': ahead}
+
+    progress('save', 0, 1)
+    jp, zp = result_paths(ckpt, ep_dir)
+    os.makedirs(os.path.dirname(jp), exist_ok=True)
+    f32 = lambda x: np.asarray(x, np.float32)    # noqa: E731
+    np.savez_compressed(zp[:-4] + '.tmp.npz', f_seg=np.array(F['seg'], np.int16),
+                        f_i=np.array(F['i'], np.int32), f_t=f32(F['t']), f_xyz=f32(F['xyz']),
+                        f_rpy=f32(F['rpy']), f_grip=f32(F['grip']), f_px=f32(F['px']),
+                        g_t=f32(np.concatenate(grid['t'])), g_seg=np.concatenate(grid['seg']).astype(np.int16),
+                        g_px=f32(np.concatenate(grid['px'])))
+    os.replace(zp[:-4] + '.tmp.npz', zp)
+    res = {
+        'checkpoint': os.path.relpath(os.path.abspath(ckpt), REPO), 'episode': key,
+        'epoch': info['epoch'], 'dataset': info['dataset'], 'stamp': st,
+        'segments': [{'seg': si, 'span': [round(float(s['grid'][0] - t0), 3), round(float(s['grid'][-1] - t0), 3)],
+                      'steps': len(s['grid']),
+                      'split': split_of(mine, si)}
+                     for si, s in enumerate(segs)],
+        'trim': trim, 'verify': verify, 'metrics': metrics,
+        'horizon': horizon, 'down_sample': down, 'step_s': round(down / hz, 4),
+        'n_action_steps': info['n_action_steps'], 'scene_size': list(size),
+        'settings': {'device': str(device), 'ema': bool(cfg.training.use_ema),
+                     'inference_steps': int(policy.num_inference_steps)},
+        'seconds': {'load': round(t_load, 1), 'forecast': round(t_inf, 1),
+                    'total': round(time.time() - t_start, 1)},
+        'made_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    with open(jp + '.tmp', 'w') as f:
+        json.dump(res, f, indent=1)
+    os.replace(jp + '.tmp', jp)
+    return res
+
+
+def summary(r):
+    """The result in a few lines: how far off the forecasts are, against standing still."""
+    out = [f'{r["episode"]}  epoch {r["epoch"]}  {r["verify"]["status"]}'
+           + (f'  (input vs training {r["verify"]["input_diff"]}/255)' if 'input_diff' in r['verify'] else '')]
+    for split, m in r['metrics'].items():
+        out.append(f'  {split.replace("_", " ")}: {m["forecasts"]} forecasts')
+        for a in m['ahead']:
+            if a['step'] in (r['n_action_steps'], r['horizon'] - 1):
+                out.append(f'    {a["s"]:.2f} s ahead   position {a["pos_mm"]:6.1f} mm (still {a["pos_still_mm"]:6.1f})'
+                           f'   rotation {a["rot_deg"]:5.1f} deg (still {a["rot_still_deg"]:5.1f})'
+                           f'   gripper {a["grip_mm"]:5.1f} mm (still {a["grip_still_mm"]:5.1f})')
+    return '\n'.join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('-c', '--checkpoint', required=True)
+    ap.add_argument('-e', '--episode', required=True, help='data/capture/<session>/epNNN')
+    ap.add_argument('--intrinsics', default=CALIB_JSON)
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--stride', type=int, default=None,
+                    help='grid steps between forecasts (default: one observation step)')
+    ap.add_argument('--force', action='store_true', help='re-run even if a result is cached')
+    args = ap.parse_args()
+    av.logging.set_level(av.logging.PANIC)
+
+    def progress(stage, i, n):
+        print(f'PROGRESS {stage} {i} {n}', flush=True)
+    r = evaluate(args.checkpoint, args.episode, args.intrinsics, args.seed, args.stride,
+                 args.force, progress)
+    print(summary(r), flush=True)
+    print(f'wrote {result_paths(args.checkpoint, args.episode)[0]}', flush=True)
 
 
 if __name__ == '__main__':

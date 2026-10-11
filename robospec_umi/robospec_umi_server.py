@@ -77,6 +77,7 @@ log_job = log.getChild('job')         # subprocesses
 log_edit = log.getChild('edit')       # dataset editing + prep queue
 log_cal = log.getChild('calibration')  # activate / import / delete
 log_train = log.getChild('train')     # checkpoint downloads
+log_eval = log.getChild('eval')       # evaluation without a robot
 
 
 class QuietLibav(logging.Filter):
@@ -118,7 +119,8 @@ class QuietPaths(logging.Filter):
     """
 
     NOISY = ('/api/camera', '/api/capture/session', '/api/calibration/session',
-             '/assets/', '/api/health', '/api/edit/', '/api/train/', '/api/capture/test/')
+             '/assets/', '/api/health', '/api/edit/', '/api/train/', '/api/capture/test/',
+             '/api/eval/')
 
     def filter(self, record):
         msg = record.getMessage()
@@ -133,6 +135,7 @@ CALIB_DIR = os.path.join(HERE, 'robospec_umi_calibration')
 CAPTURE_DIR = os.path.join(HERE, 'robospec_umi_capture')
 CAPTURE_ROOT = os.path.join(DATA, 'capture')
 DATASET_DIR = os.path.join(HERE, 'robospec_umi_dataset')
+EVAL_DIR = os.path.join(HERE, 'robospec_umi_evaluation')
 DATASET_ROOT = os.path.join(DATA, 'dataset')
 OUTPUTS_ROOT = os.path.join(DATA, 'outputs')
 TRAIN_CONFIG = os.path.join(REPO, 'diffusion_policy', 'config',
@@ -142,6 +145,7 @@ ACTIVE_JSON = os.path.join(CALIB_ROOT, 'scene_intrinsics.json')
 sys.path.insert(0, CALIB_DIR)
 sys.path.insert(0, CAPTURE_DIR)
 sys.path.insert(0, DATASET_DIR)
+sys.path.insert(0, EVAL_DIR)
 import calibrate_scene_cam as CS                        # noqa: E402
 import scene_cam_charuco_detector as DT                 # noqa: E402
 import preview as PV                                    # noqa: E402
@@ -149,6 +153,7 @@ import capture as CAP                                   # noqa: E402
 import episode_prep as EP                               # noqa: E402
 import timeline as TL                                   # noqa: E402
 import verify as VF                                     # noqa: E402
+import eval_without_robot as EV                         # noqa: E402
 
 JPEG_QUALITY = 80
 # Downscaled from 1080p before encoding: the operator is aiming a board, not
@@ -2062,13 +2067,6 @@ def _require_prepped(d, videos=True):
         raise _http(web.HTTPConflict, 'episode is not prepared yet')
 
 
-def _rpy_deg(R):
-    """(n,3,3) -> (n,3) extrinsic XYZ roll/pitch/yaw in degrees."""
-    return np.degrees(np.stack([np.arctan2(R[:, 2, 1], R[:, 2, 2]),
-                                np.arcsin(np.clip(-R[:, 2, 0], -1, 1)),
-                                np.arctan2(R[:, 1, 0], R[:, 0, 0])], 1))
-
-
 def _decimate(n, most=600):
     return np.arange(0, n, max(1, -(-n // most)))
 
@@ -2092,7 +2090,7 @@ def _timeline(d):
         T = tr['T_tcp'][use]
         xyz[use] = T[:, :3, 3] * 1000
         # unwrapped over the kept frames: roll sits near +-180 on this rig
-        rpy[use] = np.degrees(np.unwrap(np.radians(_rpy_deg(T[:, :3, :3])), axis=0))
+        rpy[use] = np.degrees(np.unwrap(np.radians(TL.rpy_deg(T[:, :3, :3])), axis=0))
     idx = _decimate(len(t))
     grip = TL.gripper_track(d)
     if grip is not None:
@@ -2403,9 +2401,10 @@ def _runs():
             runs.setdefault(run, [])
         for f in ckpts:
             st = os.stat(os.path.join(root, f))
-            runs[run].append({'path': os.path.relpath(os.path.join(root, f), OUTPUTS_ROOT),
-                              'name': f, 'size_mb': round(st.st_size / 1e6, 1),
-                              'mtime': st.st_mtime, 'saving': now - st.st_mtime < 30})
+            p = os.path.join(root, f)
+            runs[run].append({'path': os.path.relpath(p, OUTPUTS_ROOT),
+                              'name': f, 'size_mb': round(st.st_size / 1e6, 1), 'mtime': st.st_mtime,
+                              'saving': now - st.st_mtime < 30 and p not in UPLOADED})
     out = []
     for run, ckpts in runs.items():
         logp = os.path.join(run, 'logs.json.txt')
@@ -2416,7 +2415,8 @@ def _runs():
         out.append({
             'run': os.path.relpath(run, OUTPUTS_ROOT),
             'dataset': next((o.split('=', 1)[1] for o in ov if isinstance(o, str)
-                             and o.startswith('task.dataset_path=')), None),
+                             and o.startswith('task.dataset_path=')),
+                            (cfg.get('task') or {}).get('dataset_path')),
             'num_epochs': (cfg.get('training') or {}).get('num_epochs'),
             'progress': last and {k: last.get(k) for k in ('epoch', 'global_step', 'train_loss')},
             'running': bool(last) and now - os.path.getmtime(logp) < 120,
@@ -2430,18 +2430,265 @@ async def train_runs(request):
     return web.json_response(await asyncio.to_thread(_runs))
 
 
-async def train_ckpt(request):
-    rel = request.query.get('path', '')
+def _ckpt_path(rel):
+    """A checkpoint under data/outputs/, by its path relative to it."""
     root = os.path.realpath(OUTPUTS_ROOT)
-    path = os.path.realpath(os.path.join(root, rel))
+    path = os.path.realpath(os.path.join(root, rel or ''))
     if not (path.startswith(root + os.sep) and path.endswith('.ckpt') and os.path.isfile(path)):
         raise _http(web.HTTPNotFound, f'no checkpoint {rel}')
-    # the run in the name, so latest.ckpt from two runs cannot collide
-    name = os.path.relpath(path, root).replace(os.sep + 'checkpoints' + os.sep, os.sep)
-    name = name.replace(os.sep, '_')
+    return path
+
+
+async def train_ckpt(request):
+    rel = request.query.get('path', '')
+    path = _ckpt_path(rel)
+    # the run in the name, so latest.ckpt from two runs cannot collide; the
+    # evaluation names its results folder the same way
+    name = os.path.basename(EV.result_dir(path)) + '.ckpt'
     log_train.info('download %s (%.0f MB)', rel, os.path.getsize(path) / 1e6)
     return web.FileResponse(path, headers={
         'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+# ================================================== evaluation (no robot)
+EVAL = {'job': None}     # the one evaluation that may run at a time
+UPLOADED = set()         # checkpoints filed by an upload: new, but complete
+_CKPT = {}               # checkpoint path -> (mtime, EV.describe() or {'error'})
+
+
+def _ckpt_info(path):
+    """What a checkpoint trained on, cached by mtime: reading it is 0.06 s, but
+    the list reads every checkpoint."""
+    mt = os.path.getmtime(path)
+    hit = _CKPT.get(path)
+    if hit and hit[0] == mt:
+        return hit[1]
+    try:
+        info = EV.describe(path)
+    except Exception as e:                       # noqa: BLE001
+        info = {'error': f'not a training checkpoint ({type(e).__name__}: {e})'}
+    _CKPT[path] = (mt, info)
+    return info
+
+
+def _headline(r):
+    """A result's furthest forecast step per split, for the episode list."""
+    out = {}
+    for split, m in r['metrics'].items():
+        a = m['ahead'][-1] if m['ahead'] else None
+        out[split] = a and {k: a[k] for k in ('s', 'pos_mm', 'pos_still_mm')}
+    return out
+
+
+async def eval_checkpoints(request):
+    def build():
+        out = []
+        for r in _runs():
+            for c in r['checkpoints']:
+                if c['saving']:
+                    continue
+                i = _ckpt_info(os.path.join(OUTPUTS_ROOT, c['path']))
+                out.append({**c, 'run': r['run'], 'error': i.get('error'), 'epoch': i.get('epoch'),
+                            'dataset': i.get('dataset'), 'dataset_here': bool(i.get('project_file'))})
+        return out
+    return web.json_response(await asyncio.to_thread(build))
+
+
+async def eval_checkpoint(request):
+    """A checkpoint, its dataset's recordings with their split, and every other
+    recording on disk, each with its cached result if there is one."""
+    path = _ckpt_path(request.query.get('path'))
+
+    def build():
+        i = _ckpt_info(path)
+        if 'error' in i:
+            raise _http(web.HTTPBadRequest, i['error'])
+        key, rec = _prep_key(), _recording_dir()
+
+        def row(k, segs=None):
+            d = os.path.join(CAPTURE_ROOT, k)
+            r = EV.read_result(path, d)
+            return {'key': k, 'here': os.path.isdir(d), 'segments': segs,
+                    'prepped': bool(key) and os.path.isdir(d) and EP.is_prepped(d, key),
+                    'result': r and _headline(r)}
+        others = []
+        if os.path.isdir(CAPTURE_ROOT):
+            for s in sorted(os.listdir(CAPTURE_ROOT), reverse=True):
+                d = os.path.join(CAPTURE_ROOT, s)
+                if SESS_RE.match(s) and d != rec:
+                    others += [row(f'{s}/{e}') for e in _episodes_on_disk(d)
+                               if f'{s}/{e}' not in i['recordings']]
+        return {'path': os.path.relpath(path, OUTPUTS_ROOT), 'epoch': i['epoch'],
+                'global_step': i['global_step'], 'dataset': i['dataset'], 'project': i['project'],
+                'dataset_here': bool(i['project_file']), 'horizon': i['horizon'],
+                'step_s': i['down_sample'] / TL.GRID_HZ, 'n_action_steps': i['n_action_steps'],
+                'episodes': [row(k, s) for k, s in sorted(i['recordings'].items())],
+                'others': others}
+    return web.json_response(await asyncio.to_thread(build))
+
+
+def _jl(a, d=2):
+    """Array -> nested lists, NaN as null (JSON has no NaN)."""
+    a = np.round(np.asarray(a, np.float64), d)
+    return np.where(np.isfinite(a), a, None).tolist()
+
+
+async def eval_result(request):
+    path = _ckpt_path(request.query.get('path'))
+    d = _ep_dir(*request.query.get('episode', '').partition('/')[::2])
+
+    def build():
+        r = EV.read_result(path, d)
+        if r is None:
+            raise _http(web.HTTPNotFound, 'not evaluated yet')
+        _, zp = EV.result_paths(path, d)
+        with np.load(zp) as z:
+            arrays = {k: (z[k].tolist() if z[k].dtype.kind in 'iu' else _jl(z[k])) for k in z.files}
+        st = r['stamp']
+        stale = EV.stamp(path, d, ACTIVE_JSON, st['seed'], st['stride']) != st
+        return {**r, 'stale': stale, 'arrays': arrays}
+    return web.json_response(await asyncio.to_thread(build))
+
+
+async def eval_run(request):
+    """Prep the recording through the prep queue if it needs it (so the Edit
+    page never races it), then run eval_without_robot.py on it."""
+    body = await request.json()
+    rel = body.get('path')
+    path = _ckpt_path(rel)
+    k = body.get('episode', '')
+    d = _ep_dir(*k.partition('/')[::2])
+    if not os.path.isdir(d):
+        raise _http(web.HTTPNotFound, f'no recording {k}')
+    j = EVAL['job']
+    if j and j['status'] in ('prep', 'running'):
+        return json_err(409, f'evaluating {j["episode"]}; one at a time')
+    if BROKER.recording(BROKER.DEVICES):
+        return json_err(409, 'a capture is recording -- evaluate after it stops')
+    key = _prep_key()
+    if key is None:
+        return json_err(409, 'no active scene intrinsic: calibrate or upload one first')
+    job = EVAL['job'] = {'path': rel, 'episode': k, 'status': 'prep', 'stage': 'prep',
+                         'pct': 0, 'err': None, 'proc': None, 'at': None}
+    asyncio.create_task(_eval_job(job, path, d, k, key, bool(body.get('force'))))
+    return web.json_response({'ok': True})
+
+
+async def _eval_job(job, path, d, k, key, force):
+    t0 = time.time()
+    try:
+        if not EP.is_prepped(d, key):
+            await asyncio.to_thread(PREP.want, [k], k, None, key['intrinsics_sha1'])
+            while True:
+                v = PREP.view([k]).get(k) or {}
+                if v.get('status') == 'done':
+                    break
+                if v.get('status') != 'running' and v.get('status') != 'queued':
+                    raise RuntimeError(f'preparing {k} failed: {v.get("err") or "dropped"}')
+                job['pct'] = v.get('pct', 0)
+                await asyncio.sleep(0.5)
+        job.update(status='running', stage='decode', pct=0)
+        cmd = [sys.executable, '-u', EV.__file__, '-c', path, '-e', d, '--intrinsics', ACTIVE_JSON,
+               *(['--force'] if force else [])]
+        log_eval.info('%s on %s started', k, os.path.relpath(path, OUTPUTS_ROOT))
+        proc = job['proc'] = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=REPO)
+        tail = []
+        async for raw in proc.stdout:
+            line = raw.decode(errors='replace').rstrip()
+            if line.startswith('PROGRESS '):
+                _, stage, i, n = line.split()
+                job.update(stage=stage, pct=round(100 * int(i) / max(int(n), 1)))
+            elif line:
+                tail = (tail + [line])[-20:]
+        rc = await proc.wait()
+        if rc != 0:
+            raise RuntimeError(next((ln for ln in reversed(tail) if ln.strip()), f'exit code {rc}'))
+        job.update(status='done', stage='done', pct=100, at=time.time())
+        log_eval.info('%s done in %.0f s', k, time.time() - t0)
+    except Exception as e:                       # noqa: BLE001
+        job.update(status='failed', err=str(e))
+        log_eval.error('%s failed: %s', k, e)
+    finally:
+        job['proc'] = None
+
+
+async def eval_state(request):
+    resp = web.StreamResponse(headers={
+        'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no'})
+    await resp.prepare(request)
+    last = None
+    try:
+        while (request.transport is not None and not request.transport.is_closing()
+               and not STOPPING.is_set()):
+            j = EVAL['job']
+            txt = json.dumps(j and {k: j[k] for k in ('path', 'episode', 'status', 'stage', 'pct', 'err', 'at')})
+            if txt != last:
+                await resp.write(f'data: {txt}\n\n'.encode())
+                last = txt
+            await asyncio.sleep(0.25)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    return resp
+
+
+CKPT_NAME_RE = re.compile(r'^[\w.=-]+\.ckpt$')
+
+
+async def eval_upload(request):
+    """A checkpoint trained on another PC -> data/outputs/<its run>/checkpoints/,
+    the run named by the checkpoint's own config, so the Training page and the
+    evaluation treat it like a local one. Streamed; only disk limits it."""
+    name = request.query.get('name', '')
+    if not CKPT_NAME_RE.match(name):
+        return json_err(400, f'bad checkpoint file name: {name}')
+    need = request.content_length or 0
+    os.makedirs(OUTPUTS_ROOT, exist_ok=True)
+    free = shutil.disk_usage(OUTPUTS_ROOT).free
+    if need + (1 << 30) > free:
+        return json_err(507, f'not enough disk: {need / 1e9:.1f} GB upload, {free / 1e9:.1f} GB free')
+    tmp = os.path.join(OUTPUTS_ROOT, '.upload')      # dot: _runs skips it
+    os.makedirs(tmp, exist_ok=True)
+    part = os.path.join(tmp, name + '.part')
+    size = 0
+    try:
+        try:
+            with open(part, 'wb') as f:
+                async for chunk in request.content.iter_chunked(1 << 20):
+                    f.write(chunk)
+                    size += len(chunk)
+        except ConnectionResetError:
+            return json_err(400, 'connection lost')
+        if need and size != need:
+            return json_err(400, f'{name}: upload cut short at {size / 1e6:.0f} MB')
+        try:
+            cfg, _ = await asyncio.to_thread(EV.read_cfg, part)
+            run_dir = str(cfg.multi_run.run_dir)
+        except Exception:                        # noqa: BLE001
+            return json_err(400, f'{name} is not a training checkpoint')
+        m = re.search(r'(?:^|/)outputs/(.+?)/?$', run_dir)
+        run = m.group(1) if m else os.path.basename(run_dir)
+        prefix = run.replace('/', '_') + '_'      # a downloaded name carries its run
+        fname = name[len(prefix):] if name.startswith(prefix) else name
+        dest = os.path.join(OUTPUTS_ROOT, run, 'checkpoints', fname)
+        if os.path.exists(dest):
+            return json_err(409, f'{run}/checkpoints/{fname} is already here'
+                            + ('' if os.path.getsize(dest) == size else ' (a different file)'))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.replace(part, dest)
+        UPLOADED.add(dest)
+        hydra_cfg = os.path.join(OUTPUTS_ROOT, run, '.hydra', 'config.yaml')
+        if not os.path.exists(hydra_cfg):         # so the Training page shows its dataset
+            from omegaconf import OmegaConf
+            os.makedirs(os.path.dirname(hydra_cfg), exist_ok=True)
+            with open(hydra_cfg, 'w') as f:
+                f.write(OmegaConf.to_yaml(cfg))
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+    log_eval.info('uploaded %s -> %s (%.0f MB)', name, os.path.relpath(dest, OUTPUTS_ROOT), size / 1e6)
+    return web.json_response({'ok': True, 'path': os.path.relpath(dest, OUTPUTS_ROOT), 'run': run})
 
 
 # --------------------------------------------------------- run-dir file serve
@@ -2546,6 +2793,8 @@ async def on_cleanup(app):
     app['reaper'].cancel()
     app['edit_pump'].cancel()
     PREP.stop()
+    if EVAL['job'] and EVAL['job'].get('proc'):
+        EVAL['job']['proc'].terminate()
     for name in list(SESSIONS):
         _stop_session(name)
 
@@ -2632,6 +2881,12 @@ def build_app():
     r.add_get('/api/train/gpu', train_gpu)
     r.add_get('/api/train/runs', train_runs)
     r.add_get('/api/train/ckpt', train_ckpt)
+    r.add_get('/api/eval/checkpoints', eval_checkpoints)
+    r.add_get('/api/eval/checkpoint', eval_checkpoint)
+    r.add_post('/api/eval/upload', eval_upload)
+    r.add_post('/api/eval/run', eval_run)
+    r.add_get('/api/eval/state', eval_state)
+    r.add_get('/api/eval/result', eval_result)
 
     r.add_get('/', index)
     if ui_built():

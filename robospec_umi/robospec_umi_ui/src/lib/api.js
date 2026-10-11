@@ -106,13 +106,26 @@ export const api = {
   gpu:           ()          => req('GET',  '/api/train/gpu'),
   trainRuns:     ()          => req('GET',  '/api/train/runs'),
   ckptUrl:       (path)      => `/api/train/ckpt?path=${encodeURIComponent(path)}`,
+
+  // evaluation without a robot: `path` is a checkpoint relative to data/outputs/
+  evalCheckpoints: ()        => req('GET',  '/api/eval/checkpoints'),
+  evalCheckpoint:  (path)    => req('GET',  `/api/eval/checkpoint?path=${encodeURIComponent(path)}`),
+  evalRun:   (path, episode, force = false) => req('POST', '/api/eval/run', { path, episode, force }),
+  evalResult:      (path, episode) =>
+    req('GET', `/api/eval/result?path=${encodeURIComponent(path)}&episode=${encodeURIComponent(episode)}`),
 }
 
-/** Upload one file into data/dataset/. XHR, because fetch reports no upload progress. */
-export function uploadDataset(file, onProgress) {
+/** Upload one file into data/dataset/. */
+export const uploadDataset = (file, onProgress) => uploadFile('/api/datasets/upload', file, onProgress)
+
+/** Upload a checkpoint; the server files it under data/outputs/<its run>/checkpoints/. */
+export const uploadCheckpoint = (file, onProgress) => uploadFile('/api/eval/upload', file, onProgress)
+
+/** Raw-body upload. XHR, because fetch reports no upload progress. */
+function uploadFile(url, file, onProgress) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest()
-    x.open('POST', `/api/datasets/upload?name=${encodeURIComponent(file.name)}`)
+    x.open('POST', `${url}?name=${encodeURIComponent(file.name)}`)
     x.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded, e.total)
     x.onload = () => {
       let data

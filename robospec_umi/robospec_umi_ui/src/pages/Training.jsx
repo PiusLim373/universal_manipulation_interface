@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Copy, Check, Download, Cpu, Terminal, Loader2 } from 'lucide-react'
+import { Copy, Check, Download, Cpu, Terminal, Loader2, FlaskConical } from 'lucide-react'
 import Page from '@/components/Page'
 import { useDatasetUpload } from '@/components/DatasetUpload'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -204,10 +204,16 @@ function Runs() {
                           ? <span className="text-xs text-muted-foreground inline-flex items-center gap-1 w-24 justify-end">
                               <Loader2 className="size-3 animate-spin" /> saving…
                             </span>
-                          : <a href={api.ckptUrl(c.path)} download
-                               className={cn(buttonVariants({ size: 'sm', variant: 'outline' }), 'w-24')}>
-                              <Download className="size-3.5" /> Download
-                            </a>}
+                          : <>
+                              <Link to={`/evaluation/offline?ckpt=${encodeURIComponent(c.path)}`}
+                                    className={cn(buttonVariants({ size: 'sm', variant: 'outline' }), 'w-24')}>
+                                <FlaskConical className="size-3.5" /> Evaluate
+                              </Link>
+                              <a href={api.ckptUrl(c.path)} download
+                                 className={cn(buttonVariants({ size: 'sm', variant: 'outline' }), 'w-24')}>
+                                <Download className="size-3.5" /> Download
+                              </a>
+                            </>}
                       </div>
                     ))}
                   </div>

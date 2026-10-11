@@ -35,11 +35,11 @@ data/
 │       └── epNNN/derived/        <- edit/export cache (tracking, preview videos); safe to delete
 ├── dataset/
 │   ├── <datetime>_dataset.json   <- the edit project: sessions, verify results, trims, export report
-│   └── <datetime>_dataset.zarr.zip  <- what training and evaluation read
+│   └── <datetime>_dataset.zarr.zip  <- what training reads
 ├── outputs/
-│   └── <date>/                   <- training runs and checkpoints
+│   └── <date>/<run>/checkpoints/ <- training runs and checkpoints, uploaded ones too
 └── evaluation/
-    └── <datetime>/               <- one directory per evaluation run
+    └── <checkpoint>/             <- eval results, one .json + .npz per recording
 ```
 
 ---
@@ -133,8 +133,8 @@ server, so edits are live:
 npm run dev                       # http://localhost:5173
 ```
 
-Calibration is fully wired. Capture, Edit, Training and Evaluation are
-placeholder pages that name the CLI command to use meanwhile.
+Every page is wired: Calibration, Capture, Edit, Training and Evaluation (Eval
+With Robot is still to come).
 
 **Only one thing can stream a camera at a time.** V4L2 gives exclusive access,
 so starting calibration capture while the test view holds the camera returns a
@@ -501,75 +501,57 @@ port 8080 off the public internet.
 
 ## 5. Evaluation
 
-Runs a trained policy on recorded footage with no robot attached, so you can tell
-whether a checkpoint learned anything before committing hardware to finding out.
+**Evaluation** on the home page offers *Eval Without Robot* (*Eval With Robot*
+is coming). It runs a trained checkpoint along a recording, so you can tell
+whether it learned anything before committing hardware to finding out.
+
+**Pick a checkpoint.** Every checkpoint under `data/outputs/` is listed, and
+the Training page's **Evaluate** opens one directly. A checkpoint trained on
+another PC goes in with **Upload checkpoint**: its own config names the run it
+came from, so it is filed under `data/outputs/<run>/checkpoints/` exactly as it
+was there, and the Training page lists it too.
+
+**Pick an episode.** The checkpoint also names the dataset it trained on, so
+each of that dataset's recordings is labelled from its project file:
+
+- **held out**: the episodes training kept back for validation (`val_ratio`
+  and `seed` from the checkpoint). Never trained on, so these are the honest
+  test.
+- **trained on**: reproducing these proves the plumbing, little more.
+- **other recordings**: everything else on disk, e.g. a new session shot
+  after training.
+
+**Run.** The model gets what it would on the robot: the raw wrist video,
+cropped and resized as for training, plus the recorded TCP pose and gripper
+width, built into its input by the robot-side helpers in
+`umi/real_world/real_inference_util.py`. At every observation step (50 ms) it
+forecasts the next 0.75 s. A trimmed episode is evaluated over exactly the span
+that went into the dataset, and **verified** means the recomputed span
+reproduces the dataset's steps and poses exactly. *input x/255* is how far the
+raw images are from the training images (the dataset's compression, about
+0.7). The recording is prepped first if it needs it; about 10 s in all on a
+GPU.
+
+**Read it.** The graphs draw the recorded TCP position, rotation and gripper
+opening as solid lines, and every forecast as a dashed stub starting on them.
+Stubs that hug the line are good forecasts; how far one peels off is its error.
+The forecast at the playhead is bold, and on the scene video the TCP's real
+next 0.75 s (white) is drawn against the forecast (amber, dashed). The numbers
+compare each error with **standing still**, i.e. predicting no motion. Because
+the forecasts are relative to the current pose, standing still already scores
+well whenever the hand moves slowly, so only the comparison means anything:
+"70% better" means the model removes 70% of standing still's error.
+
+From the command line, the same thing:
 
 ```bash
-python robospec_umi/robospec_umi_evaluation/eval_without_robot.py
+python robospec_umi/robospec_umi_evaluation/eval_without_robot.py \
+    -c data/outputs/<date>/<run>/checkpoints/<epoch>.ckpt -e data/capture/<session>/ep003
 ```
 
-With no arguments it picks the newest checkpoint under `data/outputs/`, the
-newest dataset under `data/dataset/`, and `ep000` of the newest session under
-`data/capture/` — **announcing each choice**, because evaluating the wrong
-checkpoint produces numbers that look entirely ordinary. Override any of them:
+Results land in `data/evaluation/<checkpoint>/<session>_<ep>.{json,npz}` and are
+reused until the checkpoint, the recording's prep or the intrinsics change.
 
-```bash
-... -c data/outputs/2026.09.09/epoch=0110-train_loss=0.013.ckpt
-... -z data/dataset/dataset.zarr.zip
-... -e data/capture/20260919_150000/ep003
-... --no-video           numbers only; skips the ~2 GB wrist decode, much faster
-... --log-samples 0 200  full per-step predicted-vs-actual tables for those samples
-```
-
-Results land in `data/evaluation/<datetime>/`:
-
-- **`summary.json`** — checkpoint, epoch, inputs, and per-split error and gains.
-  Written so two checkpoints can be compared without re-reading scrollback.
-- **`eval_annotated.mp4`** — wrist frame beside the predicted and actual motion
-  for that frame, badged TRAIN or VAL.
-
-### How to read the numbers
-
-The policy emits 16 future steps of `[3 position | 6D rotation | 1 gripper]`,
-expressed **relative to the current pose**. Three things decide whether the error
-means anything, and none of them is the raw millimetre figure.
-
-**The no-motion baseline is the whole story.** Because actions are relative,
-predicting all zeros — "stay exactly where you are" — already scores well
-whenever the hand moves slowly. Its error *is* the distance the hand actually
-moved, so it is printed beside every result. A model that learned nothing still
-posts flattering millimetre errors. Only the ratio to this baseline means
-anything.
-
-**Train vs val.** Reproducing training data proves the plumbing works and nothing
-about generalisation. The gap between the two splits is the actual finding.
-
-**Per horizon step, never a bare mean.** Step 0 is degenerate — the first action
-is the current pose relative to itself, so true motion is 0.0 mm and the ratio is
-undefined. What matters is that the ratio **rises** with horizon: that is what
-separates predicting motion from predicting small numbers.
-
-A healthy result looks like this — gain climbing from 4× to 10× across the chunk:
-
-```
- step  t ahead  true move  model err   gain     true rot   rot err   gain
-    4    0.25s       21.3        5.3  4.02x         1.84      1.66  1.11x
-    8    0.45s       41.8        7.0  5.98x         2.52      1.62  1.56x
-   15    0.80s       75.6        7.6  9.94x         3.60      1.77  2.03x
-```
-
-Rotation is scored separately because it can fail while position succeeds, and a
-position headline would hide that completely. A rotation gain **below 1.0** means
-the predicted rotation is further from the truth than predicting *no* rotation —
-the model is actively making it worse.
-
-### Two things this measurement cannot escape
-
-**It is open loop.** Ground truth is fed at every step, so errors never compound
-the way they will on a robot closing the loop on its own predictions. Read it as
-a lower bound on real error, never an estimate of it.
-
-**The annotated video may contain no VAL frames.** `UmiDataset` holds out whole
-zarr episodes, so a video of `ep000` shows val frames only when `ep000` is itself
-the held-out episode. The script says so when it happens; point `-e` at the
-held-out episode to see the comparison.
+**It is open loop.** Every forecast starts from the recorded pose, so errors
+never compound the way they will on a robot closing the loop on its own
+predictions. Read it as a lower bound on real error, never an estimate of it.

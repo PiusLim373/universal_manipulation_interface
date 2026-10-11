@@ -62,9 +62,12 @@ export function Waiting({ label, prep, paused, err, onRetry,
 /* ------------------------------------------------------------------- player
    Annotated scene + wrist in sync, the graphs, the status bar with what export
    keeps, and the transport. With onTrim it also marks the trim. Remount it (key)
-   per episode: playback state is its own, bar the speed when a parent holds it. */
+   per episode: playback state is its own, bar the speed when a parent holds it.
+   graphs({time, trim}) / sceneOverlay({time}) replace the graphs and draw over
+   the scene video; note replaces the export line. */
 export default function EpisodePlayer({ tl, plan, src, trim = null, onTrim, locked = false,
-                                        rate: heldRate, onRate }) {
+                                        rate: heldRate, onRate, graphs, sceneOverlay,
+                                        spanLabel = 'exported', note }) {
   const [time, setTime] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [ownRate, setOwnRate] = useState(1)
@@ -188,7 +191,8 @@ export default function EpisodePlayer({ tl, plan, src, trim = null, onTrim, lock
 
   return (
     <>
-      <div className="flex-1 min-h-0 grid grid-cols-[3fr_2fr] grid-rows-[2fr_1fr] gap-2"
+      <div className={cn('flex-1 min-h-0 grid grid-cols-[3fr_2fr] gap-2',
+                         graphs ? 'grid-rows-[3fr_2fr]' : 'grid-rows-[2fr_1fr]')}
            onWheel={(e) => step(e.deltaY > 0 ? 1 : -1)}>
         <div className="relative min-h-0 bg-black rounded-md overflow-hidden">
           <span className="absolute top-1.5 right-2 z-10 text-[10px] text-white/70 bg-black/50 px-1.5 rounded">
@@ -198,6 +202,7 @@ export default function EpisodePlayer({ tl, plan, src, trim = null, onTrim, lock
                  src={src('scene_annotated.mp4')}
                  className="w-full h-full object-contain"
                  onEnded={() => setPlaying(false)} />
+          {sceneOverlay?.({ time })}
         </div>
         <div className="relative min-h-0 bg-black rounded-md overflow-hidden">
           <span className="absolute top-1.5 right-2 z-10 text-[10px] text-white/70 bg-black/50 px-1.5 rounded">
@@ -216,13 +221,15 @@ export default function EpisodePlayer({ tl, plan, src, trim = null, onTrim, lock
             </svg>
           )}
         </div>
-        <TcpGraph tcp={tl.tcp} duration={tl.duration_s} time={time} trim={trim} />
-        <div className="min-h-0 flex flex-col gap-1">
-          <GripperGraph className="flex-1" gripper={tl.gripper} duration={tl.duration_s}
-                        time={time} trim={trim} />
-          {tl.imu && <ImuGraph className="flex-1" imu={tl.imu} duration={tl.duration_s}
-                               time={time} trim={trim} />}
-        </div>
+        {graphs ? <div className="col-span-2 min-h-0 grid">{graphs({ time, trim })}</div> : <>
+          <TcpGraph tcp={tl.tcp} duration={tl.duration_s} time={time} trim={trim} />
+          <div className="min-h-0 flex flex-col gap-1">
+            <GripperGraph className="flex-1" gripper={tl.gripper} duration={tl.duration_s}
+                          time={time} trim={trim} />
+            {tl.imu && <ImuGraph className="flex-1" imu={tl.imu} duration={tl.duration_s}
+                                 time={time} trim={trim} />}
+          </div>
+        </>}
       </div>
 
       <div className="space-y-1.5">
@@ -235,10 +242,10 @@ export default function EpisodePlayer({ tl, plan, src, trim = null, onTrim, lock
             </span>
           ))}
           <span className="flex items-center gap-1">
-            <span className="w-3 h-2 rounded-sm bg-primary" />exported
+            <span className="w-3 h-2 rounded-sm bg-primary" />{spanLabel}
           </span>
           <span className="flex-1" />
-          {plan?.error ? <span className="text-destructive">{plan.error}</span>
+          {note || (plan?.error ? <span className="text-destructive">{plan.error}</span>
             : !plan ? <span>checking…</span>
             : plan.reason
               ? <span className="text-[#f59e0b] flex items-center gap-1">
@@ -249,7 +256,7 @@ export default function EpisodePlayer({ tl, plan, src, trim = null, onTrim, lock
               : <span className="text-foreground">
                   export keeps {plan.kept_s.toFixed(2)} s in {plan.spans.length} segment
                   {plan.spans.length === 1 ? '' : 's'} · usable {(plan.usable * 100).toFixed(0)}%
-                </span>}
+                </span>)}
         </div>
       </div>
 
