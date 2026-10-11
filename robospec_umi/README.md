@@ -105,11 +105,11 @@ One image with the full environment, GPU access, the cameras, and the UI server.
 ```bash
 export ROBOSPEC_UMI_DIRECTORY=/path/to/universal_manipulation_interface
 xhost +local:docker            # only needed for cv2.imshow windows
-# only if `id -u` is not 1000:
+# only if `id -u` is not 1000 (e.g. a GCP VM); no rebuild needed:
 #   export ROBOSPEC_UID=$(id -u) ROBOSPEC_GID=$(id -g)
 
 docker compose -f robospec_umi/robospec_umi_compose.yaml build
-docker compose -f robospec_umi/robospec_umi_compose.yaml up -d
+docker compose -f robospec_umi/robospec_umi_compose.yaml up -d --force-recreate
 docker compose -f robospec_umi/robospec_umi_compose.yaml exec robospec bash
 ```
 
@@ -152,9 +152,14 @@ Four things worth knowing:
   the upstream UMI dependency set — `robosuite`, `ray`, `free-mujoco-py` and
   `ur-rtde` together add over a gigabyte and are imported by nothing in this
   pipeline, so there is room to trim if the size ever matters.
-- **`export ROBOSPEC_UID`, not `export UID`.** Bash marks `UID` readonly, so
-  `export UID=$(id -u)` errors outright. The build args default to 1000, so on a
-  normal single-user machine you can skip this and files still land owned by you.
+- **The container runs as `ROBOSPEC_UID:ROBOSPEC_GID`, chosen at `up`, not at
+  build.** One image works on every machine: on your laptop (UID 1000) skip the
+  export; on a host where you are, say, 1001 (a GCP VM), export both before `up`
+  so the UI, prep and `docker exec` can write into your `data/`. `--force-recreate`
+  applies a changed user to an existing container. A shell in it then shows
+  "I have no name!", because that UID has no account in the image; it is harmless,
+  and `HOME` is `/tmp`. Use `export ROBOSPEC_UID`, not `export UID`: bash marks
+  `UID` readonly, so `export UID=$(id -u)` errors outright.
 - **`xhost +local:docker` grants any local container access to your X server.**
   Fine on a personal rig; think before running it on a shared machine. Skip it
   entirely if you do not need `cv2.imshow`.
@@ -307,15 +312,26 @@ different distances. The fitted slope should be within ±1% of 1.000.
 
 ### 3a. Record
 
-In the web UI, **Capture** is two stages — *Preview & Lock*, then *Capture
-Dataset* — reached from the home page. One session owns both cameras across both
-stages: they open once when you enter Preview & Lock and stay open until you
-press Finish, so the 3 s warm-up is paid while you are tuning rather than again
-on the way into recording, and the RealSense pipeline is started exactly once.
+In the web UI, **Capture** is three stages — *Preview & Lock*, *Capture Test*,
+then *Capture Dataset* — reached from the home page. One session owns both
+cameras across all of them: they open once when you enter Preview & Lock and stay
+open until you press Finish, so the 3 s warm-up is paid while you are tuning
+rather than again on the way into recording, and the RealSense pipeline is
+started exactly once. The stepper switches stages whenever nothing is recording.
 
 Preview & Lock shows both cameras. The scene panel is the same one calibration
 uses (auto or manual exposure, white balance, gamma, gain) plus the geometry
 lock. Controls are frozen for the duration of each episode.
+
+**Capture Test** records one throwaway episode (SPACE, as for a real one) into
+`<session>/test/`, preps it at once with every free core, and shows it in the
+Edit player with a score (`score_episode` in `verify.py`): board tracked, what
+export keeps, pose spikes, position / rotation jitter, reprojection error,
+frame and gripper rates, IMU fusion, and the verify checks. Each metric that is
+not green says what to change. Re-record as often as you like; continuing (or
+Skip test) deletes it, and it never becomes an episode. Record a realistic
+demo: a gripper held still gives the gyro nothing to fit, so the IMU reads
+"vision only".
 
 The wrist camera is a RealSense **D455** or **D405**, detected at session start
 (`WRIST_MODELS` in `capture.py`):
@@ -365,15 +381,15 @@ sending lines (`arduino/UMI_Force_Angle.ino`, ~40 Hz). Each line is stamped on
 arrival on the cameras' CLOCK_MONOTONIC. `gripper_ts.npz` keeps the raw pot
 reading and the raw force value as sent; the force is not used yet. The opening
 becomes `robot0_gripper_width` in metres: linear, raw 0 → 0 m, raw 1146 → 0.115 m
-(`GRIPPER_RAW_OPEN` / `GRIPPER_MAX_WIDTH` in `capture.py`, saved in each file). Both
-capture stages show it live. Sessions recorded before the gripper fail verify.
+(`GRIPPER_RAW_OPEN` / `GRIPPER_MAX_WIDTH` in `capture.py`, saved in each file). Every
+capture stage shows it live. Sessions recorded before the gripper fail verify.
 
 **The D455's IMU is recorded too**, into `imu/imu_ts.npz`: gyro (rad/s) and accel
 (m/s²) at 200 Hz, each with its own `t_ns` on the same clock, plus the factory
 colour→IMU extrinsic. The gyro is fused into the pose track (see below); the accel
 is not used yet. Its intrinsics are uncalibrated (factory identity). A D455
-session will not start if the IMU does not; a D405 has none. Both capture stages
-show it live.
+session will not start if the IMU does not; a D405 has none. Every capture stage
+shows it live.
 
 **The preview is deliberately lossy.** It samples the stream and skips frames on
 purpose so recording never waits on the display. A large on-screen `skipped`

@@ -330,6 +330,131 @@ def verify_session(d, intrinsics=None):
             'lines': lines}
 
 
+# ------------------------------------------------------------- capture test
+# key -> (label, good, ok, weight). A metric scores 1 at `good`, 0.5 at `ok` and
+# 0 as far again past it; higher-is-better ones simply have good > ok.
+SCORE = {
+    'tracked': ('Board tracked', 0.99, 0.95, 15),
+    'usable': ('Export keeps', 0.98, TL.MIN_VALID, 20),
+    'spikes': ('Pose spikes', 0.01, 0.05, 15),
+    'jitter_mm': ('Position jitter', 0.5, 1.5, 20),
+    'jitter_deg': ('Rotation jitter', 0.1, 0.5, 10),
+    'reproj_px': ('Reprojection', 0.4, 0.8, 5),
+    'scene_rate': ('Scene frame rate', 0.97, 0.90, 5),
+    'wrist_rate': ('Wrist frame rate', 0.97, 0.90, 5),
+    'gripper_hz': ('Gripper rate', 35, 25, 3),
+    'imu': ('IMU fusion', 1, 0, 2),
+}
+VERDICT = {'good': 'Good to record', 'ok': 'Usable, could be better',
+           'bad': 'Fix the setup', 'fail': 'Fix before recording'}
+
+
+def _grade(v, good, ok):
+    s = (v - good) / (ok - good)        # 0 at good, 1 at ok, either direction
+    if s <= 0:
+        return 1.0, 'good'
+    return max(0.0, 1 - 0.5 * s), 'ok' if s <= 1 else 'bad'
+
+
+def pose_noise(T, keep):
+    """Median |X[i] - midpoint(X[i-1], X[i+1])| over consecutive kept frames, in
+    mm and deg: smooth motion adds well under 0.1 mm at 120 fps, so it is noise."""
+    i = np.nonzero(keep[:-2] & keep[1:-1] & keep[2:])[0] + 1
+    if not len(i):
+        return None, None
+    P = T[:, :3, 3] * 1000
+    mm = np.linalg.norm(P[i] - (P[i - 1] + P[i + 1]) / 2, axis=1)
+    R0, R1, R2 = T[i - 1, :3, :3], T[i, :3, :3], T[i + 1, :3, :3]
+    mid = R0 @ V.so3_exp(V.so3_log(V.T_inv(R0) @ R2) / 2)
+    deg = np.degrees(np.linalg.norm(V.so3_log(V.T_inv(mid) @ R1), axis=1))
+    return float(np.median(mm)), float(np.median(deg))
+
+
+def _fps(d, cam):
+    p = os.path.join(d, cam, f'{cam}_ts.npz')
+    t = np.load(p)['t_ns'].astype(np.float64) / 1e9 if os.path.exists(p) else []
+    return (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 else None
+
+
+def score_episode(d, meta, intrinsics=None):
+    """Score one prepped episode as a check of the rig before recording: the
+    verify checks, plus the pose quality and stream rates. -> {score, verdict,
+    label, metrics, info, fails, warnings, lines}"""
+    intrinsics = intrinsics or CALIB_JSON
+    log = Log()
+    check_session(meta, log, intrinsics)
+    for cam, check in (('scene', check_scene), ('wrist', check_wrist)):
+        if os.path.isdir(os.path.join(d, cam)):
+            check(d, meta, log)
+    check_gripper(d, log)
+    check_imu(d, meta, log)
+    check_overlap(d, log)
+
+    with open(TL.ep_path(d, 'prep.json')) as f:
+        prep = json.load(f)
+    tr = TL.load_track(d)
+    T, st = tr['T_tcp'], tr['status']
+    keep = tr['tracked'] & (st != TL.SPIKE)
+    mm, deg = pose_noise(T, keep)
+    dist = float(np.median(np.linalg.norm(T[keep, :3, 3], axis=1))) if keep.any() else None
+    n_pts = np.load(TL.ep_path(d, TL.TCP_NPZ))['n_pts']
+    u, imu = prep['untrimmed'], prep.get('imu') or {}
+    grip = TL.gripper_track(d)
+    n_spike = int((st == TL.SPIKE).sum())
+    rms = float(np.nanmedian(tr['rms'])) if keep.any() else None
+    near = f'the gripper is {dist:.2f} m from the scene camera' if dist else 'the board is far'
+    v = {
+        'tracked': (prep['tracked'], f'{prep["tracked"]:.1%}',
+                    'the board was lost: keep it in view, check light and motion blur'),
+        'usable': (u['usable'], f'{u["usable"]:.1%}',
+                   u['reason'] or 'pose gaps or missing wrist frames cost grid points'),
+        'spikes': (n_spike / max(int((st != TL.LOST).sum()), 1), f'{n_spike} frames',
+                   'pose flips: view the board less face-on, or move the scene camera closer'),
+        'jitter_mm': (mm, f'{mm:.2f} mm' if mm is not None else '—',
+                      f'{near}: move it closer, check focus and light'),
+        'jitter_deg': (deg, f'{deg:.2f}°' if deg is not None else '—',
+                       f'{near}: a closer, sharper board steadies the orientation'),
+        'reproj_px': (rms, f'{rms:.2f} px' if rms is not None else '—',
+                      'corners off the board model: check focus, blur and the active calibration'),
+    }
+    for cam, nom in (('scene', meta['scene'].get('fps_requested')),
+                     ('wrist', meta.get('wrist', {}).get('fps'))):
+        fps = _fps(d, cam)
+        if fps and nom:
+            v[f'{cam}_rate'] = (fps / nom, f'{fps:.1f} of {nom} fps',
+                                'frames lost: check USB bandwidth and CPU load')
+    if grip is not None:
+        hz = (len(grip[0]) - 1) / (grip[0][-1] - grip[0][0])
+        v['gripper_hz'] = (hz, f'{hz:.1f} Hz', 'gripper sensor below rate: check its serial link')
+    if imu.get('fused') or imu.get('reason') != 'no imu recording':
+        v['imu'] = (1 if imu.get('fused') else 0.5, 'fused' if imu.get('fused') else 'vision only',
+                    imu.get('reason') or '')
+
+    metrics, total, weight, worst = [], 0.0, 0, 'good'
+    for k, (label, good, ok, w) in SCORE.items():
+        if k not in v:
+            continue
+        val, text, hint = v[k]
+        s, g = _grade(val, good, ok) if val is not None else (0.0, 'bad')
+        total, weight = total + w * s, weight + w
+        worst = max(worst, g, key=('good', 'ok', 'bad').index)
+        metrics.append({'key': k, 'label': label, 'value': text, 'grade': g,
+                        'hint': None if g == 'good' else hint})
+    score = round(100 * total / max(weight, 1))
+    # good only with every metric good; bad below 70 or if export drops it
+    verdict = ('fail' if log.fails else 'bad' if u['reason'] or score < 70
+               else 'good' if worst == 'good' else 'ok')
+    rows, cols = TL.TRACK_BOARD['size']
+    info = [f'{prep["duration_s"]:.1f} s']
+    if dist:
+        info.append(f'gripper {dist:.2f} m from the scene camera')
+    if keep.any():
+        info.append(f'{int(np.median(n_pts[keep]))}/{(rows - 1) * (cols - 1)} corners seen')
+    return {'score': score, 'verdict': verdict,
+            'label': VERDICT[verdict], 'metrics': metrics, 'info': info,
+            'fails': log.fails, 'warnings': log.warns, 'lines': log.lines}
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)

@@ -94,6 +94,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -212,6 +213,9 @@ WARMUP = 3.0
 # every wrist frame has scene poses on both sides to interpolate between. Timing
 # critical: shortening this leaves wrist frames at the episode edges unlabelled.
 LEAD = 0.2
+# The capture test's episode dir, under the session. Not 'ep*', so nothing that
+# lists episodes sees it; deleted on reset, on leaving the test and at finish.
+TEST_DIR = 'test'
 
 # ------------------------------------------------------------------- preview
 # Sampled and deliberately lossy. A 1080p scene JPEG costs ~10 ms to decode and
@@ -547,11 +551,16 @@ class SceneRecorder(GatedRecorder):
                 ist, tb = payload
                 continue
             if kind == 'PREPARE':
-                if ist is None or pending is not None:
+                if ist is None or (pending is not None and pending[0] == payload):
                     continue
+                discard_pending(pending)       # another dir's, e.g. the capture test's
+                pending = None
                 p = os.path.join(payload, 'scene.mkv')
-                c = av.open(p, 'w')
-                pending = (payload, p, c, c.add_stream(template=ist))  # no re-encode
+                try:
+                    c = av.open(p, 'w')
+                    pending = (payload, p, c, c.add_stream(template=ist))  # no re-encode
+                except Exception:              # dir deleted meanwhile; ARM opens inline
+                    log.warning('could not pre-open %s', p)
                 continue
             if kind == 'ARM':
                 if pending is None or pending[0] != payload:
@@ -915,8 +924,13 @@ class WristRecorder(GatedRecorder):
                 break
             kind, payload = item
             if kind == 'PREPARE':
-                if pending is None:
-                    pending = self._open(payload)   # NVENC session built while idle
+                if pending is None or pending[0] != payload:
+                    discard_pending(pending)
+                    pending = None
+                    try:
+                        pending = self._open(payload)   # NVENC session built while idle
+                    except Exception:               # dir deleted meanwhile; ARM opens inline
+                        log.warning('could not pre-open %s', payload)
                 continue
             if kind == 'ARM':
                 if pending is None or pending[0] != payload:
@@ -1319,8 +1333,9 @@ class RecordSession:
         self.episodes, self.ep_i = [], 0
         self.recording, self.t_ep = False, None
         self.transition = None            # 'arming' | 'stopping' -- the UI's WAITING
+        self.testing, self.test_ep = False, None
         self._lock = threading.RLock()
-        self._prepared = set()
+        self._pending = None              # the dir whose containers are pre-opened
         self._closed = False
 
         try:
@@ -1374,7 +1389,7 @@ class RecordSession:
         time.sleep(max(0.0, WARMUP - (mono() - self.t_warm)))
         with self._lock:
             if not self._closed and not self.recording:
-                self._prep_ep(0)
+                self._prep_ep(self.ep_i)
 
     # ---------------------------------------------------------------- state
     def _sensors(self):
@@ -1391,8 +1406,9 @@ class RecordSession:
         equality against this path, so two call sites that differ by a trailing
         slash silently discard the prepared container and reopen it inline --
         paying back the frames prepare() exists to save, with no error anywhere.
+        In test mode every index lands in TEST_DIR.
         """
-        d = os.path.join(self.dir, f'ep{i:03d}')
+        d = os.path.join(self.dir, TEST_DIR if self.testing else f'ep{i:03d}')
         return d if cam is None else os.path.join(d, cam)
 
     @property
@@ -1418,6 +1434,7 @@ class RecordSession:
             'episode_index': self.ep_i, 'n_episodes': len(self.episodes),
             'elapsed_s': round(mono() - self.t_ep, 2) if self.recording else 0.0,
             'episodes': self.episodes,
+            'testing': self.testing, 'test': self.test_ep,
             'cameras': {k: {'fps': round(r.meter.fps(), 1), 'written': r.written,
                             'live': r.live, 'queue_drops': r.dropped,
                             'armed': r.armed, 'error': r.err}
@@ -1455,14 +1472,45 @@ class RecordSession:
 
     # ------------------------------------------------------------- episodes
     def _prep_ep(self, i):
-        if i in self._prepared:
+        if self._pending == self.ep_dir(i):
             return
         for k, r in self.recs.items():
             os.makedirs(self.ep_dir(i, k), exist_ok=True)
             r.prepare(self.ep_dir(i, k))
         for k, _ in self._sensors():
             os.makedirs(self.ep_dir(i, k), exist_ok=True)
-        self._prepared.add(i)
+        self._pending = self.ep_dir(i)
+
+    # ----------------------------------------------------------- capture test
+    def set_testing(self, on):
+        """Enter or leave the capture test. Either way the test dir starts empty,
+        and the recorders swap their pre-opened containers to the right dir."""
+        with self._lock:
+            if on == self.testing:
+                return
+            if self.recording:
+                raise RecordError('an episode is recording; stop it first')
+            self._drop_test()
+            self.testing = on
+            if self.ready:          # before that, _housekeep prepares it
+                self._prep_ep(self.ep_i)
+
+    def reset_test(self):
+        """Delete the test recording and ready the next one."""
+        with self._lock:
+            if self.recording:
+                raise RecordError('the test is recording; stop it first')
+            if not self.testing:
+                return
+            self._drop_test()
+            if self.ready:
+                self._prep_ep(self.ep_i)
+
+    def _drop_test(self):
+        shutil.rmtree(os.path.join(self.dir, TEST_DIR), ignore_errors=True)
+        self.test_ep = None
+        if self._pending == os.path.join(self.dir, TEST_DIR):
+            self._pending = None
 
     def start_episode(self):
         """-> the episode index. Blocks for LEAD seconds."""
@@ -1488,6 +1536,7 @@ class RecordSession:
                     time.sleep(LEAD)
                 if 'wrist' in self.recs:
                     self.recs['wrist'].arm(self.ep_dir(i, 'wrist'))
+                self._pending = None
                 self.t_ep = mono()
                 self.recording = True
             finally:
@@ -1512,7 +1561,7 @@ class RecordSession:
                 # Not padding: save() reads the row lists from THIS thread while
                 # the writer thread may still be draining its queue toward DISARM.
                 time.sleep(0.4)
-                ep = {'index': i, 'dir': f'ep{i:03d}',
+                ep = {'index': i, 'dir': os.path.basename(self.ep_dir(i)),
                       'duration_s': mono() - self.t_ep}
                 for k, r in self.recs.items():
                     n, fps = r.save()
@@ -1522,10 +1571,15 @@ class RecordSession:
                                  'late': self.gripper.late - self.gripper.late_at_arm}
                 if self.imu:
                     ep['imu'] = self.imu.save()
-                self.episodes.append(ep)
                 self.recording = False
-                self.ep_i = i + 1
-                self._prep_ep(self.ep_i)   # ready the next one while idle
+                if self.testing:
+                    # reviewed, never an episode; the next test is readied by
+                    # reset_test, since preparing now would truncate these files
+                    self.test_ep = ep
+                else:
+                    self.episodes.append(ep)
+                    self.ep_i = i + 1
+                    self._prep_ep(self.ep_i)   # ready the next one while idle
             finally:
                 self.transition = None
             return ep
@@ -1614,6 +1668,7 @@ class RecordSession:
                 self.stop_episode()
             self._closed = True
         self.close_cameras()
+        self._drop_test()
         self._prune_empty()
         m = self.meta(display)
         with open(os.path.join(self.dir, 'session.json'), 'w') as f:

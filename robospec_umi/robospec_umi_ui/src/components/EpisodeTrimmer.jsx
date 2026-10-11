@@ -1,35 +1,18 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Loader2, Lock, Scissors, Play, Pause, ChevronLeft, ChevronRight, ChevronsLeft,
-  ChevronsRight, ChevronDown, AlertTriangle, RotateCcw, X, Clock, Ban,
+  Loader2, Lock, Scissors, ChevronRight, ChevronDown, AlertTriangle, Clock, Ban,
 } from 'lucide-react'
-import TrimBar from '@/components/TrimBar'
-import { STATUS_LEGEND } from '@/lib/editStatus'
-import TcpGraph from '@/components/TcpGraph'
-import GripperGraph from '@/components/GripperGraph'
-import ImuGraph from '@/components/ImuGraph'
+import EpisodePlayer, { Waiting } from '@/components/EpisodePlayer'
 import useHotkeys from '@/hooks/useHotkeys'
 import { Button } from '@/components/ui/button'
 import { api, sse } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
-const SPEEDS = [0.25, 0.5, 1]
 const EMPTY = { excluded: false, trim: null }
 const f2 = (v) => (v == null ? '—' : v.toFixed(2))
 const ago = (ms) => {
   const s = Math.round((Date.now() - ms) / 1000)
   return s < 5 ? 'just now' : s < 60 ? `${s}s ago` : new Date(ms).toLocaleTimeString()
-}
-
-// Largest i with t[i] <= v.
-function frameAt(t, v) {
-  let lo = 0, hi = t.length - 1
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1
-    if (t[mid] <= v + 1e-4) lo = mid
-    else hi = mid - 1
-  }
-  return lo
 }
 
 /* ------------------------------------------------------------ episode list */
@@ -93,41 +76,6 @@ const EpisodeRow = memo(function EpisodeRow({ e, edit, prep, selected, onPick })
   )
 })
 
-/* ------------------------------------------------------ not-ready placeholder */
-function Waiting({ ep, prep, paused, err, onRetry }) {
-  let body
-  if (err) {
-    body = <><AlertTriangle className="size-6 text-destructive" />
-      <p className="text-sm text-destructive max-w-md text-center break-words">{err}</p>
-      <Button size="sm" variant="outline" onClick={onRetry}><RotateCcw className="size-4" /> Retry</Button></>
-  } else if (prep?.status === 'failed') {
-    body = <><AlertTriangle className="size-6 text-destructive" />
-      <p className="text-sm">Preparing {ep.key} failed</p>
-      <p className="text-xs text-muted-foreground max-w-md text-center break-words">{prep.err}</p>
-      <Button size="sm" variant="outline" onClick={onRetry}><RotateCcw className="size-4" /> Retry</Button></>
-  } else if (paused && prep?.status !== 'running') {
-    body = <><Clock className="size-6 text-muted-foreground" />
-      <p className="text-sm text-muted-foreground">
-        Preparation paused while {paused === 'recording' ? 'a capture is recording' : 'an export runs'}
-      </p></>
-  } else {
-    const running = prep?.status === 'running'
-    body = <><Loader2 className="size-6 animate-spin text-primary" />
-      <p className="text-sm">{running ? 'Preparing this episode' : 'Queued for preparation'}</p>
-      {running && <>
-        <div className="w-64 h-1.5 rounded-full bg-muted overflow-hidden">
-          <div className="h-full bg-primary transition-all" style={{ width: `${prep.pct}%` }} />
-        </div>
-        <p className="text-xs text-muted-foreground tabular-nums">{prep.stage} · {prep.pct}%</p>
-      </>}
-      <p className="text-xs text-muted-foreground max-w-sm text-center">
-        ChArUco detection, pose track and preview videos, saved beside the recording so
-        they are only built once.
-      </p></>
-  }
-  return <div className="flex-1 flex flex-col items-center justify-center gap-3 bg-black/40 rounded-md">{body}</div>
-}
-
 /* ------------------------------------------------------------------ trimmer */
 export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound }) {
   const pid = project.id
@@ -144,9 +92,7 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
   const [tl, setTl] = useState(null)
   const [tlErr, setTlErr] = useState(null)
   const [plan, setPlan] = useState(null)
-  const [time, setTime] = useState(0)
-  const [playing, setPlaying] = useState(false)
-  const [rate, setRate] = useState(1)
+  const [rate, setRate] = useState(1)       // kept from episode to episode
   const [save, setSave] = useState({ state: 'idle', at: null, err: null })
   const [collapsed, setCollapsed] = useState(() => new Set())
   const toggleSession = (sess) => setCollapsed((c) => {
@@ -156,8 +102,6 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
     return n
   })
   const [, tick] = useState(0)
-  const sceneRef = useRef(null)
-  const wristRef = useRef(null)
 
   const ep = episodes.find((e) => e.key === current)
   const cur = prep.episodes[current]
@@ -182,7 +126,7 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
 
   /* -------- timeline of the current episode */
   const loadTl = useCallback(() => {
-    setTl(null); setTlErr(null); setPlan(null); setTime(0); setPlaying(false)
+    setTl(null); setTlErr(null); setPlan(null)
     if (!current || !ready) return undefined
     let dead = false
     api.timeline(current).then((d) => { if (!dead) setTl(d) })
@@ -240,103 +184,6 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
     return () => clearInterval(id)
   }, [save.state])
 
-  /* -------- playback */
-  const off = tl?.wrist_offset_s ?? 0
-  const wdur = tl?.wrist_duration_s ?? 0
-  const syncWrist = useCallback((t, hard, play) => {
-    const w = wristRef.current
-    if (!w) return
-    const target = Math.min(Math.max(t - off, 0), wdur)
-    if (hard || Math.abs(w.currentTime - target) > 0.05) w.currentTime = target
-    const inside = t >= off && t - off < wdur
-    if (play && inside && w.paused) w.play().catch(() => {})
-    if ((!play || !inside) && !w.paused) w.pause()
-  }, [off, wdur])
-
-  const pause = useCallback(() => {
-    const v = sceneRef.current
-    v?.pause()
-    setPlaying(false)
-    if (v) { setTime(v.currentTime); syncWrist(v.currentTime, true, false) }
-  }, [syncWrist])
-
-  const seek = useCallback((t) => {
-    const v = sceneRef.current
-    if (!v || !tl) return
-    t = Math.min(Math.max(t, 0), tl.duration_s)
-    v.currentTime = t
-    setTime(t)
-    syncWrist(t, true, playing)
-  }, [tl, playing, syncWrist])
-
-  const play = useCallback(() => {
-    const v = sceneRef.current
-    if (!v || !tl) return
-    let t = v.currentTime
-    if (trim && ((trim[0] != null && t < trim[0]) || (trim[1] != null && t >= trim[1] - 0.01))) {
-      t = trim[0] ?? 0
-      v.currentTime = t
-    } else if (t >= tl.duration_s - 0.01) {
-      t = 0
-      v.currentTime = 0
-    }
-    v.play().catch(() => {})
-    setPlaying(true)
-    syncWrist(t, true, true)
-  }, [tl, trim, syncWrist])
-
-  useEffect(() => {
-    if (!playing) return undefined
-    let id
-    const loop = () => {
-      const v = sceneRef.current
-      if (!v) return
-      const t = v.currentTime
-      if (trim?.[1] != null && t >= trim[1]) {
-        v.pause()
-        v.currentTime = trim[1]
-        setPlaying(false)
-        setTime(trim[1])
-        syncWrist(trim[1], true, false)
-        return
-      }
-      setTime(t)
-      syncWrist(t, false, true)
-      id = requestAnimationFrame(loop)
-    }
-    id = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(id)
-  }, [playing, trim, syncWrist])
-
-  useEffect(() => {
-    for (const v of [sceneRef.current, wristRef.current]) if (v) v.playbackRate = rate
-  }, [rate, tl])
-
-  const fi = tl ? frameAt(tl.t, time) : 0
-  const step = (d) => {
-    if (!tl) return
-    if (playing) pause()
-    const i = Math.min(Math.max(fi + d, 0), tl.t.length - 1)
-    seek(tl.t[i] + 0.0005)
-  }
-
-  /* -------- marks */
-  const here = () => (tl ? Math.round(tl.t[fi] * 1e4) / 1e4 : 0)
-  const markIn = () => {
-    if (!tl || ep?.locked) return
-    const v = here()
-    update(current, (e) => ({ ...e, trim: [v, e.trim?.[1] != null && e.trim[1] > v ? e.trim[1] : null] }))
-  }
-  const markOut = () => {
-    if (!tl || ep?.locked) return
-    const v = here()
-    update(current, (e) => ({ ...e, trim: [e.trim?.[0] != null && e.trim[0] < v ? e.trim[0] : null, v] }))
-  }
-  const clearMark = (k) => update(current, (e) => {
-    const t = [...(e.trim || [null, null])]
-    t[k] = null
-    return { ...e, trim: t[0] == null && t[1] == null ? null : t }
-  })
   const toggleExclude = () => {
     if (!ep || ep.locked) return
     update(current, (e) => ({ ...e, excluded: !e.excluded }))
@@ -355,20 +202,13 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
     })
   }
 
+  // playback and trim keys are the player's
   useHotkeys({
-    ' ': () => (playing ? pause() : play()),
-    ArrowLeft: (e) => step(e.shiftKey ? -10 : -1),
-    ArrowRight: (e) => step(e.shiftKey ? 10 : 1),
-    '[': markIn,
-    ']': markOut,
     x: toggleExclude,
     X: toggleExclude,
     ArrowUp: () => move(-1),
     ArrowDown: () => move(1),
-    1: () => setRate(0.25),
-    2: () => setRate(0.5),
-    3: () => setRate(1),
-  }, true, ['ArrowLeft', 'ArrowRight'])
+  })
 
   const included = open.filter((e) => !(edits[e.key] || EMPTY).excluded).length
 
@@ -443,123 +283,14 @@ export default function EpisodeTrimmer({ project, onContinue, onEdits, onUnbound
         </div>
 
         {!ready || !tl ? (
-          <Waiting ep={ep || {}} prep={cur} paused={prep.paused} err={tlErr}
+          <Waiting label={current} prep={cur} paused={prep.paused} err={tlErr}
                    onRetry={() => { setTlErr(null); if (ready) loadTl(); else focus() }} />
         ) : (
           <>
-            <div className="flex-1 min-h-0 grid grid-cols-[3fr_2fr] grid-rows-[2fr_1fr] gap-2"
-                 onWheel={(e) => step(e.deltaY > 0 ? 1 : -1)}>
-              <div className="relative min-h-0 bg-black rounded-md overflow-hidden">
-                <span className="absolute top-1.5 right-2 z-10 text-[10px] text-white/70 bg-black/50 px-1.5 rounded">
-                  scene · annotated
-                </span>
-                <video key={`s-${current}`} ref={sceneRef} muted playsInline preload="auto"
-                       src={api.media(current, 'scene_annotated.mp4', prepAt)}
-                       className="w-full h-full object-contain"
-                       onEnded={() => setPlaying(false)} />
-              </div>
-              <div className="relative min-h-0 bg-black rounded-md overflow-hidden">
-                <span className="absolute top-1.5 right-2 z-10 text-[10px] text-white/70 bg-black/50 px-1.5 rounded">
-                  wrist
-                </span>
-                <video key={`w-${current}`} ref={wristRef} muted playsInline preload="auto"
-                       src={api.media(current, 'wrist.mp4', prepAt)}
-                       className="w-full h-full object-contain" />
-                {/* the training crop; 'meet' scales it exactly like object-contain */}
-                {tl.wrist_crop && (
-                  <svg className="absolute inset-0 w-full h-full pointer-events-none"
-                       viewBox={`0 0 ${tl.wrist_crop.w} ${tl.wrist_crop.h}`}
-                       preserveAspectRatio="xMidYMid meet">
-                    <rect x={tl.wrist_crop.x0} y={0} width={tl.wrist_crop.size} height={tl.wrist_crop.h}
-                          fill="none" stroke="#facc15" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
-                  </svg>
-                )}
-              </div>
-              <TcpGraph tcp={tl.tcp} duration={tl.duration_s} time={time} trim={trim} />
-              <div className="min-h-0 flex flex-col gap-1">
-                <GripperGraph className="flex-1" gripper={tl.gripper} duration={tl.duration_s}
-                              time={time} trim={trim} />
-                {tl.imu && <ImuGraph className="flex-1" imu={tl.imu} duration={tl.duration_s}
-                                     time={time} trim={trim} />}
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <TrimBar t={tl.t} status={tl.status} duration={tl.duration_s}
-                       spans={plan?.spans} trim={trim} time={time} onSeek={seek} />
-              <div className="flex items-center gap-3 text-[11px] text-muted-foreground flex-wrap">
-                {STATUS_LEGEND.map(([c, label]) => (
-                  <span key={label} className="flex items-center gap-1">
-                    <span className="size-2 rounded-sm" style={{ background: c }} />{label}
-                  </span>
-                ))}
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-2 rounded-sm bg-primary" />exported
-                </span>
-                <span className="flex-1" />
-                {plan?.error ? <span className="text-destructive">{plan.error}</span>
-                  : !plan ? <span>checking…</span>
-                  : plan.reason
-                    ? <span className="text-[#f59e0b] flex items-center gap-1">
-                        <AlertTriangle className="size-3.5" />
-                        export drops this episode: {plan.reason}
-                        {!trim && ' (trim off the bad stretch to keep the rest)'}
-                      </span>
-                    : <span className="text-foreground">
-                        export keeps {plan.kept_s.toFixed(2)} s in {plan.spans.length} segment
-                        {plan.spans.length === 1 ? '' : 's'} · usable {(plan.usable * 100).toFixed(0)}%
-                      </span>}
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 flex-wrap">
-              <Button size="icon-sm" variant="outline" onClick={() => step(-10)} title="Back 10 frames (Shift+←)">
-                <ChevronsLeft className="size-4" /></Button>
-              <Button size="icon-sm" variant="outline" onClick={() => step(-1)} title="Previous frame (←)">
-                <ChevronLeft className="size-4" /></Button>
-              <Button size="icon-sm" onClick={() => (playing ? pause() : play())} title="Play / pause (Space)">
-                {playing ? <Pause className="size-4" /> : <Play className="size-4" />}</Button>
-              <Button size="icon-sm" variant="outline" onClick={() => step(1)} title="Next frame (→)">
-                <ChevronRight className="size-4" /></Button>
-              <Button size="icon-sm" variant="outline" onClick={() => step(10)} title="Forward 10 frames (Shift+→)">
-                <ChevronsRight className="size-4" /></Button>
-              <span className="font-mono text-xs tabular-nums ml-1">
-                <span className="text-foreground">{f2(time)}</span>
-                <span className="text-muted-foreground"> / {f2(tl.duration_s)} s · frame {fi}/{tl.t.length - 1}</span>
-              </span>
-              <div className="flex items-center rounded-md border border-border overflow-hidden ml-2">
-                {SPEEDS.map((s, i) => (
-                  <button key={s} type="button" onClick={() => setRate(s)} title={`${s}× (${i + 1})`}
-                          className={cn('px-2 h-7 text-xs tabular-nums',
-                            rate === s ? 'bg-primary text-primary-foreground' : 'hover:bg-muted')}>
-                    {s}×
-                  </button>
-                ))}
-              </div>
-
-              <span className="flex-1" />
-
-              <div className="flex items-center gap-1">
-                <Button size="sm" variant="outline" onClick={markIn} disabled={ep?.locked}
-                        className="text-[#22c55e]" title="Trim start at this frame ([)">[ In</Button>
-                {trim?.[0] != null && <>
-                  <button type="button" className="text-xs font-mono tabular-nums hover:underline"
-                          onClick={() => seek(trim[0] + 0.0005)}>{f2(trim[0])}</button>
-                  <button type="button" onClick={() => clearMark(0)} title="Clear"
-                          className="text-muted-foreground hover:text-destructive"><X className="size-3.5" /></button>
-                </>}
-              </div>
-              <div className="flex items-center gap-1">
-                <Button size="sm" variant="outline" onClick={markOut} disabled={ep?.locked}
-                        className="text-[#ef4444]" title="Trim end at this frame (])">Out ]</Button>
-                {trim?.[1] != null && <>
-                  <button type="button" className="text-xs font-mono tabular-nums hover:underline"
-                          onClick={() => seek(trim[1] - 0.0005)}>{f2(trim[1])}</button>
-                  <button type="button" onClick={() => clearMark(1)} title="Clear"
-                          className="text-muted-foreground hover:text-destructive"><X className="size-3.5" /></button>
-                </>}
-              </div>
-            </div>
+            <EpisodePlayer key={`${current}@${prepAt}`} tl={tl} plan={plan}
+                           src={(f) => api.media(current, f, prepAt)} trim={trim} locked={ep?.locked}
+                           onTrim={(t) => update(current, (e) => ({ ...e, trim: t }))}
+                           rate={rate} onRate={setRate} />
             <p className="text-[11px] text-muted-foreground">
               Space play · ←/→ frame (Shift ×10, or scroll) · [ / ] trim in/out · X exclude ·
               ↑/↓ episode · 1/2/3 speed

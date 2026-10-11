@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { VideoOff } from 'lucide-react'
 
 /**
@@ -13,8 +13,17 @@ import { VideoOff } from 'lucide-react'
 export default function CameraStream({ src, alt = 'camera', className = '' }) {
   const [url, setUrl] = useState(src)
   const [failed, setFailed] = useState(false)
+  const img = useRef(null)
 
   useEffect(() => { setUrl(`${src}?t=${Date.now()}`); setFailed(false) }, [src])
+
+  // A removed <img> keeps its stream open until it is garbage-collected, and the
+  // browser allows 6 connections per host: a few remounts and every request on
+  // the page queues behind dead streams. End it on unmount.
+  useEffect(() => {
+    const el = img.current
+    return () => el?.removeAttribute('src')
+  }, [])
 
   // The border and background live on the IMG, not on a wrapper. A bordered
   // wrapper filling the grid cell would show its own background wherever the
@@ -30,6 +39,7 @@ export default function CameraStream({ src, alt = 'camera', className = '' }) {
   return (
     <div className={`relative flex items-center justify-center min-h-0 min-w-0 ${className}`}>
       <img
+        ref={img}
         src={url}
         alt={alt}
         className="w-full max-w-full max-h-full aspect-video object-contain

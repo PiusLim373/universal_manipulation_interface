@@ -72,6 +72,14 @@ export const api = {
   finishCapture: ()          => req('POST', '/api/capture/finish'),
   capturePreview:(opts)      => req('POST', '/api/capture/preview', opts),
 
+  // the capture test: one throwaway episode in the live session, never kept
+  enterTest:     ()          => req('PUT',  '/api/capture/test'),
+  leaveTest:     ()          => req('DELETE', '/api/capture/test'),
+  resetTest:     ()          => req('POST', '/api/capture/test/reset'),
+  testEpisode:   (action)    => req('POST', '/api/capture/test/episode', { action }),
+  testReview:    ()          => req('GET',  '/api/capture/test/review'),
+  testMedia:     (file, v)   => `/api/capture/test/media/${file}?v=${encodeURIComponent(v || '')}`,
+
   // edit: `key` is 'session/epNNN'
   editSessions:  ()          => req('GET',  '/api/edit/sessions'),
   projects:      ()          => req('GET',  '/api/edit/projects'),
@@ -155,7 +163,7 @@ export const CAPTURE_PREVIEW = {
   setControls:  (cam, patch) => api.setControls(patch, cam),
   lock:         () => api.lock(),
   statsOf:      (s, cam) => s?.stats?.[cam],
-  cta:          'Continue to recording',
+  cta:          'Continue to capture test',
 }
 
 /**

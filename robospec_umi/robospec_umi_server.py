@@ -118,7 +118,7 @@ class QuietPaths(logging.Filter):
     """
 
     NOISY = ('/api/camera', '/api/capture/session', '/api/calibration/session',
-             '/assets/', '/api/health', '/api/edit/', '/api/train/')
+             '/assets/', '/api/health', '/api/edit/', '/api/train/', '/api/capture/test/')
 
     def filter(self, record):
         msg = record.getMessage()
@@ -397,6 +397,7 @@ class CapturePreview:
         self.device_keys = tuple(session.recs)
         self.err = None
         self.annotate, self.mask = True, False
+        self.review = None           # (prepared_at, the capture test's review)
         self._slots = {k: {'jpeg': None, 'stats': None, 'lock': threading.Lock(),
                            'frames': 0} for k in self.device_keys}
         self._stop = threading.Event()
@@ -528,6 +529,8 @@ class CapturePreview:
         st['annotate'], st['mask'] = self.annotate, self.mask
         st['preview_error'] = self.err
         st['stats'] = {k: self._slots[k]['stats'] for k in self.device_keys}
+        if st['testing']:
+            st['test_prep'] = _test_prep(self.session)
         return st
 
     def stop(self):
@@ -535,6 +538,7 @@ class CapturePreview:
         self._stop.set()
         for t in self._threads:
             t.join(timeout=3.0)
+        PREP.forget(_test_key(self.session))     # finish() deletes its dir
         try:
             self.session.finish()
         except Exception:                            # noqa: BLE001
@@ -1180,6 +1184,11 @@ async def capture_episode(request):
     immediately stop it. The client knows the state from the SSE; the server
     makes the stated intent idempotent.
     """
+    return await _episode(request, test=False)
+
+
+async def _episode(request, test):
+    """Start or stop a real episode, or with test=True the capture test's."""
     w = SESSIONS.get(CAPTURE_KEY)
     if w is None:
         return json_err(409, 'no capture session')
@@ -1188,6 +1197,9 @@ async def capture_episode(request):
     if action not in ('start', 'stop'):
         return json_err(400, "action must be 'start' or 'stop'")
     sess = w.session
+    if sess.testing != test:
+        return json_err(409, 'leave the capture test first' if sess.testing
+                        else 'not in the capture test')
     try:
         if action == 'start':
             if sess.recording:
@@ -1195,19 +1207,24 @@ async def capture_episode(request):
                                           **w.state()})
             i = await asyncio.to_thread(sess.start_episode)
             BROKER.set_recording(w.device_keys, True)
-            log_cap.info('ep%03d armed', i)
+            log_cap.info('%s armed', CAP.TEST_DIR if test else f'ep{i:03d}')
             return web.json_response({'ok': True, 'episode_index': i,
                                       **w.state()})
         if not sess.recording:
             return web.json_response({'ok': True, 'already': True, **w.state()})
         ep = await asyncio.to_thread(sess.stop_episode)
         BROKER.set_recording(w.device_keys, False)
-        log_cap.info('ep%03d saved  %s  (%.1fs)', ep['index'],
+        log_cap.info('%s saved  %s  (%.1fs)', ep['dir'],
                      '  '.join(f'{k} {ep[k]["frames"]}@{ep[k]["fps"]:.1f}fps'
                                + (f' {ep[k]["queue_drops"]}drop'
                                   if ep[k]['queue_drops'] else '')
                                for k in sess.recs if k in ep),
                      ep['duration_s'])
+        if test:
+            key = _prep_key()
+            if key:
+                k = _test_key(sess)
+                await asyncio.to_thread(PREP.want, [k], k, None, key['intrinsics_sha1'])
         return web.json_response({'ok': True, 'episode': ep, **w.state()})
     except CAP.RecordError as e:
         BROKER.set_recording(w.device_keys, sess.recording)
@@ -1223,6 +1240,7 @@ async def capture_finish(request):
         return json_err(409, 'an episode is recording; stop it first')
     sess = w.session
     d, stamp = sess.dir, sess.stamp
+    await asyncio.to_thread(PREP.forget, _test_key(sess))
     meta = await asyncio.to_thread(sess.finish)
     _stop_session(CAPTURE_KEY)
     log_cap.info('session %s finished: %d episode(s) -> %s',
@@ -1253,6 +1271,99 @@ async def capture_stream(request):
 
 async def capture_state(request):
     return await _sse_state(request, CAPTURE_KEY)
+
+
+# --------------------------------------------------------------- capture test
+# One throwaway episode, recorded by the live session into <session>/test,
+# prepped through the Edit queue and scored. Never kept.
+def _test_key(sess):
+    return f'{sess.stamp}/{CAP.TEST_DIR}'
+
+
+def _test_prep(sess):
+    """The test's prep as the queue reports it, or why there is none."""
+    if sess.test_ep is None:
+        return None
+    k = _test_key(sess)
+    v = PREP.view([k]).get(k)
+    if v is None and _prep_key() is None:
+        return {'status': 'failed', 'err': 'no active scene intrinsic: calibrate or upload one first'}
+    if v and v['status'] == 'queued':
+        v['paused'] = PREP.paused()
+    return v
+
+
+def _live_capture():
+    w = SESSIONS.get(CAPTURE_KEY)
+    if w is None:
+        raise _http(web.HTTPConflict, 'no capture session')
+    return w
+
+
+async def _test_mode(w, fn):
+    """Stop the test's prep, then fn (which may delete its dir) -> the state."""
+    await asyncio.to_thread(PREP.forget, _test_key(w.session))
+    w.review = None
+    try:
+        await asyncio.to_thread(fn)
+    except CAP.RecordError as e:
+        return json_err(409, str(e))
+    return web.json_response(w.state())
+
+
+async def capture_test_enter(request):
+    w = _live_capture()
+    if w.session.testing:          # a refresh keeps the test under review
+        return web.json_response(w.state())
+    log_cap.info('capture test entered')
+    return await _test_mode(w, lambda: w.session.set_testing(True))
+
+
+async def capture_test_leave(request):
+    w = SESSIONS.get(CAPTURE_KEY)
+    if w is None or not w.session.testing:
+        return web.json_response({'ok': True})
+    log_cap.info('capture test left')
+    return await _test_mode(w, lambda: w.session.set_testing(False))
+
+
+async def capture_test_reset(request):
+    w = _live_capture()
+    return await _test_mode(w, w.session.reset_test)
+
+
+async def capture_test_episode(request):
+    return await _episode(request, test=True)
+
+
+def _test_review(d, sess):
+    plan = TL.plan_episode(d, None, False)
+    return {'timeline': _timeline(d),
+            'plan': {k: plan[k] for k in ('usable', 'kept_s', 'spans', 'reason', 'note', 'grid_n')},
+            'score': VF.score_episode(d, sess.meta(), ACTIVE_JSON)}
+
+
+async def capture_test_review(request):
+    """Timeline, export plan and score of the prepped test, cached per prep."""
+    w = _live_capture()
+    sess = w.session
+    d = os.path.join(sess.dir, CAP.TEST_DIR)
+    if not sess.testing or sess.test_ep is None:
+        raise _http(web.HTTPConflict, 'no capture test recorded')
+    _require_prepped(d)
+    at = EP.read_prep(d)['prepared_at']
+    if not w.review or w.review[0] != at:
+        w.review = (at, await asyncio.to_thread(_test_review, d, sess))
+    return web.json_response(w.review[1])
+
+
+async def capture_test_media(request):
+    w = _live_capture()
+    f = request.match_info['file']
+    p = os.path.join(w.session.dir, CAP.TEST_DIR, TL.DERIVED, f)
+    if f not in MEDIA or not os.path.exists(p):
+        raise _http(web.HTTPNotFound, f'no {f} for the capture test')
+    return web.FileResponse(p, headers={'Cache-Control': 'no-cache'})
 
 
 # ------------------------------------------------------- streaming endpoints
@@ -1800,6 +1911,10 @@ class PrepQueue:
                 job['tail'] = (job['tail'] + [line])[-20:]
                 log_edit.debug('prep %s | %s', k, line)
         rc = proc.wait()
+        if job.get('forgotten'):
+            log_edit.info('prep %s stopped', k)
+            self.pump()
+            return
         with self.lock:
             job['proc'] = None
             if rc == 0:
@@ -1813,6 +1928,24 @@ class PrepQueue:
                                   f'exit code {rc}')
                 log_edit.error('prep %s failed (rc=%s):\n%s', k, rc, '\n'.join(job['tail'][-8:]))
         self.pump()
+
+    def forget(self, k):
+        """Drop k, stopping its prep if it runs: its dir is about to be deleted."""
+        with self.lock:
+            j = self.jobs.pop(k, None) or {}
+            if k in self.queue:
+                self.queue.remove(k)
+            self.owners.pop(k, None)
+            self.need.pop(k, None)
+            j['forgotten'] = True
+            proc = j.get('proc')
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
     def watch(self, pid):
         with self.lock:
@@ -2469,6 +2602,12 @@ def build_app():
     r.add_post('/api/capture/preview', capture_preview_opts)
     r.add_get('/api/capture/stream/{cam}', capture_stream)
     r.add_get('/api/capture/state', capture_state)
+    r.add_put('/api/capture/test', capture_test_enter)
+    r.add_delete('/api/capture/test', capture_test_leave)
+    r.add_post('/api/capture/test/reset', capture_test_reset)
+    r.add_post('/api/capture/test/episode', capture_test_episode)
+    r.add_get('/api/capture/test/review', capture_test_review)
+    r.add_get('/api/capture/test/media/{file}', capture_test_media)
 
     r.add_get('/api/edit/sessions', edit_sessions)
     r.add_get('/api/edit/projects', edit_projects)
