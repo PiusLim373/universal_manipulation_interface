@@ -160,12 +160,15 @@ def prepare_missing(dirs, intr_path, workers):
     todo = [d for d in dirs if not P.is_prepped(d, key, videos=False)]
     if not todo:
         return
-    print(f'preparing {len(todo)} episode(s), {workers} at a time '
+    # each episode runs its own pool of frame workers, sharing the cores
+    at_once = min(workers, len(todo))
+    per = P.prep_workers((P.usable_cores() - P.RESERVE_CORES) // at_once)
+    print(f'preparing {len(todo)} episode(s), {at_once} at a time x {per} worker(s) '
           f'(detection + pose track, no videos) ...', flush=True)
     t0 = time.time()
     # spawn, not fork: a forked child inherits whatever cv2/av threads exist
-    with ProcessPoolExecutor(workers, mp_context=mp.get_context('spawn')) as ex:
-        futs = {ex.submit(P.prepare_tracks, d, intr_path): d for d in todo}
+    with ProcessPoolExecutor(at_once, mp_context=mp.get_context('spawn')) as ex:
+        futs = {ex.submit(P.prepare_tracks, d, intr_path, per): d for d in todo}
         for k, f in enumerate(as_completed(futs), 1):
             m = f.result()
             print(f'  [{k}/{len(todo)}] {ep_name(futs[f])}: {P.summary(m)}  '

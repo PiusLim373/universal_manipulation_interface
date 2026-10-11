@@ -396,9 +396,14 @@ In the web UI, **Edit dataset** is four stages; the project autosaves to
 4. **Export Training Dataset** — writes `data/dataset/<datetime>_dataset.zarr.zip`.
 
 Preparing an episode (ChArUco detection, pose track, browser-playable videos)
-takes ~30–90 s. It runs in the background, two at a time, the viewed episode
-first, and pauses while a capture is recording. Results are cached in
-`<ep>/derived/` and reused until the active calibration changes.
+takes ~11 s for a 5 s episode on a 16-core laptop (~30 s serially). Detection and
+the annotated render are spread over worker processes sized to the machine (up
+to 8 per episode, 2 cores left free), and the videos are encoded with NVENC when
+the GPU offers it, else x264. The results are identical either way. Prep runs in
+the background at low priority, two at a time, the viewed episode first, and
+pauses while a capture is recording. Results are cached in `<ep>/derived/` and
+reused until the active calibration changes; `prep.json` records the worker
+count, encoder and per-stage seconds.
 
 A dataset is bound to the scene intrinsic that was active when it was created;
 the Edit page shows which one each dataset and each `.zarr.zip` uses. While a

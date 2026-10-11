@@ -14,16 +14,23 @@ mp4s are added later, cheaply, if the episode is opened in the trimmer.
 Each video starts at its own first frame; prep.json records wrist_offset_s, the
 wrist's start on the scene clock.
 
+Detection and the annotated render run on a pool of worker processes sized to
+the machine (usable_cores); videos are encoded with NVENC when the GPU has it,
+else x264. The detections are identical whatever the worker count.
+
 Usage:
     python3 robospec_umi/robospec_umi_dataset/episode_prep.py data/capture/<stamp>/ep000 [...]
     python3 robospec_umi/robospec_umi_dataset/episode_prep.py --calibrate-imu data/capture/<stamp>/ep*
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import time
+from collections import deque
 from fractions import Fraction
 
 import av
@@ -40,6 +47,11 @@ CALIB_JSON = os.path.join(REPO, 'data', 'calibration', 'scene_intrinsics.json')
 PREVIEW_WIDTH = 1280
 GOP = 30    # keyframe interval, so a browser seek does not decode from the start
 CRF = 23
+
+MAX_WORKERS = 8     # per prep; detection barely gains past 8 (6.9 s vs 6.6 s at 12)
+RESERVE_CORES = 2   # left for the server, the live streams and the desktop
+PREP_NICE = 10      # capture and the server keep priority over prep
+RESULT_TIMEOUT = 30  # s for one frame's result (~20 ms normally); only a dead worker hits it
 
 GREEN, AMBER, RED, GREY = (90, 210, 90), (40, 190, 245), (60, 60, 235), (150, 150, 150)
 BANNER = {
@@ -94,23 +106,163 @@ def _ts(ep_dir, cam):
     return np.load(os.path.join(ep_dir, cam, f'{cam}_ts.npz'))['t_ns']
 
 
+# ------------------------------------------------------------------- workers
+def _cgroup_cpus():
+    """A cgroup CPU quota in cores (docker --cpus), or None."""
+    for files in (('/sys/fs/cgroup/cpu.max',),
+                  ('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', '/sys/fs/cgroup/cpu/cpu.cfs_period_us')):
+        vals = []
+        try:
+            for f in files:
+                with open(f) as fh:
+                    vals += fh.read().split()
+        except OSError:
+            continue
+        if vals[0] in ('max', '-1'):
+            return None
+        return int(vals[0]) / int(vals[1])
+    return None
+
+
+def usable_cores():
+    """Cores this process may run on: its affinity, capped by a cgroup quota."""
+    n = len(os.sched_getaffinity(0))
+    q = _cgroup_cpus()
+    return max(1, min(n, int(q)) if q else n)
+
+
+def prep_workers(share):
+    return max(1, min(MAX_WORKERS, int(share)))
+
+
+def default_workers():
+    """For a prep running on its own."""
+    return prep_workers(usable_cores() - RESERVE_CORES)
+
+
+def lower_priority():
+    """Absolute, so calling it again does not keep lowering it."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, 0, max(os.getpriority(os.PRIO_PROCESS, 0), PREP_NICE))
+    except OSError:
+        pass
+
+
+_W = {}     # per worker process: the detector, a JPEG decoder and the camera
+
+
+def _worker_init(cam):
+    lower_priority()
+    cv2.setNumThreads(1)
+    av.logging.set_level(av.logging.PANIC)
+    _W.update(detect=V.make_detector(V.make_board(*TL.board_args())),
+              jpeg=av.CodecContext.create('mjpeg', 'r'), cam=cam)
+
+
+def _decode(packet, fmt):
+    """One scene JPEG through PyAV, as the serial path decodes it. cv2.imdecode
+    gives slightly different pixels, and moved corners on 5 of 652 frames."""
+    return _W['jpeg'].decode(av.Packet(packet))[0].to_ndarray(format=fmt)
+
+
+def _detect_job(packet):
+    m, cc, ci = _W['detect'](_decode(packet, 'gray'))
+    return {'markers': m, 'corners': cc, 'ids': ci}
+
+
+def _render_job(job):
+    packet, det, row, status, label, size = job
+    img = annotate(_decode(packet, 'bgr24'), det, row, status, label, _W['cam'])
+    img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    return av.VideoFrame.from_ndarray(img, format='bgr24').reformat(format='yuv420p').to_ndarray()
+
+
+class Workers:
+    """Prep worker processes. map() yields results in order with at most 4 jobs
+    per worker in flight, so frames never pile up when the encoder lags.
+
+    Pool replaces a worker that dies, but the job it held never returns, so each
+    result has a timeout: a crash fails the prep rather than hanging it. (Not
+    ProcessPoolExecutor: on 3.9 its shutdown deadlocks after a worker dies with
+    packets still queued for it.)
+    """
+
+    def __init__(self, n, cam):
+        self.n = n
+        self.pool = mp.get_context('spawn').Pool(n, _worker_init, (cam,))
+
+    def map(self, fn, items):
+        pending = deque()
+        for x in items:
+            pending.append(self.pool.apply_async(fn, (x,)))
+            if len(pending) >= 4 * self.n:
+                yield self._get(pending.popleft())
+        while pending:
+            yield self._get(pending.popleft())
+
+    @staticmethod
+    def _get(r):
+        try:
+            return r.get(RESULT_TIMEOUT)
+        except mp.TimeoutError:
+            raise RuntimeError(f'a prep worker returned nothing for {RESULT_TIMEOUT} s '
+                               '(it crashed or could not start)') from None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.pool.terminate()
+
+
+def _packets(path):
+    """The scene video's JPEG packets, demuxed lazily (no decode)."""
+    c = av.open(path)
+    try:
+        for p in c.demux(c.streams.video[0]):
+            if p.size:
+                yield bytes(p)
+    finally:
+        c.close()
+
+
 # ------------------------------------------------------------------ encoding
 class Mp4:
-    """x264 mp4 with per-frame timestamps in ms, written to a temp name first."""
+    """H.264 mp4 with per-frame timestamps in ms, written to a temp name first.
+
+    NVENC when the GPU offers it -- 3.5x faster than x264, and at cq 35 the same
+    size and quality (3.8 MB / 33.4 dB vs 3.5 MB / 33.1 dB) -- else x264.
+    bf 0: B-frames reorder the stream and the muxer rejects our pts.
+    """
+
+    CODECS = (('h264_nvenc', {'preset': 'p4', 'rc': 'vbr', 'cq': '35', 'bf': '0'}),
+              ('libx264', {'crf': str(CRF), 'preset': 'veryfast'}))
+    no_nvenc = False    # set after a failed open, so it is not retried per video
 
     def __init__(self, dst, w, h):
         self.dst, self.tmp = dst, dst[:-4] + '.tmp.mp4'
-        self.out = av.open(self.tmp, 'w', options={'movflags': '+faststart'})
-        self.st = self.out.add_stream('libx264', rate=120)
-        self.st.width, self.st.height, self.st.pix_fmt = w, h, 'yuv420p'
-        self.st.codec_context.time_base = Fraction(1, 1000)
-        self.st.codec_context.gop_size = GOP
-        self.st.options = {'crf': str(CRF), 'preset': 'veryfast'}
+        for codec, opts in self.CODECS[1 if Mp4.no_nvenc else 0:]:
+            self.out = av.open(self.tmp, 'w', options={'movflags': '+faststart'})
+            try:
+                self.st = self.out.add_stream(codec, rate=120)
+                self.st.width, self.st.height, self.st.pix_fmt = w, h, 'yuv420p'
+                self.st.codec_context.time_base = Fraction(1, 1000)
+                self.st.codec_context.gop_size = GOP
+                self.st.options = opts
+                self.st.codec_context.open()      # no usable NVENC fails here
+                self.codec = codec
+                break
+            except Exception:                     # noqa: BLE001
+                self.out.close()
+                if codec == 'libx264':
+                    raise
+                Mp4.no_nvenc = True
         self.last = -1
 
     def put(self, frame, t_ms):
-        if isinstance(frame, np.ndarray):
-            frame = av.VideoFrame.from_ndarray(frame, format='bgr24')
+        if isinstance(frame, np.ndarray):        # 2-D: a worker's ready yuv420p
+            frame = av.VideoFrame.from_ndarray(frame, format='bgr24' if frame.ndim == 3
+                                               else 'yuv420p')
         self.last = max(int(round(t_ms)), self.last + 1)
         frame.pts, frame.time_base = self.last, Fraction(1, 1000)
         for p in self.st.encode(frame):
@@ -141,32 +293,49 @@ def encode_wrist(ep_dir, progress):
         out.close()
     finally:
         c.close()
-    return i
+    return out.codec
 
 
 # --------------------------------------------------------------- scene track
-def detect(ep_dir, progress):
+def load_dets(ep_dir):
+    """Cached detections for the current board, or None."""
     path = TL.ep_path(ep_dir, 'scene_charuco_dets.npz')
     if os.path.exists(path):
         z = np.load(path, allow_pickle=True)
         if 'board' in z.files and str(z['board']) == TL.board_key():
             return list(z['dets'])
-    detect_fn = V.make_detector(V.make_board(*TL.board_args()))
+    return None
+
+
+def detect(ep_dir, progress, workers=None):
+    dets = load_dets(ep_dir)
+    if dets is not None:
+        return dets
     n = len(_ts(ep_dir, 'scene'))
-    c = av.open(os.path.join(ep_dir, 'scene', 'scene.mkv'))
-    st = c.streams.video[0]
-    st.thread_count = 4
+    src = os.path.join(ep_dir, 'scene', 'scene.mkv')
+    if workers is not None:
+        frames = workers.map(_detect_job, _packets(src))
+    else:
+        detect_fn = V.make_detector(V.make_board(*TL.board_args()))
+
+        def serial():
+            c = av.open(src)
+            st = c.streams.video[0]
+            st.thread_count = 4
+            try:
+                for f in c.decode(st):
+                    m, cc, ci = detect_fn(f.to_ndarray(format='gray'))
+                    yield {'markers': m, 'corners': cc, 'ids': ci}
+            finally:
+                c.close()
+        frames = serial()
     dets = []
-    try:
-        for f in c.decode(st):
-            m, cc, ci = detect_fn(f.to_ndarray(format='gray'))
-            dets.append({'markers': m, 'corners': cc, 'ids': ci})
-            if len(dets) % 50 == 0:
-                progress('detect', len(dets), n)
-    finally:
-        c.close()
-    _save_npz(path, dets=np.array(dets, dtype=object), n_frames=len(dets),
-              board=TL.board_key())
+    for d in frames:
+        dets.append(d)
+        if len(dets) % 50 == 0:
+            progress('detect', len(dets), n)
+    _save_npz(TL.ep_path(ep_dir, 'scene_charuco_dets.npz'), dets=np.array(dets, dtype=object),
+              n_frames=len(dets), board=TL.board_key())
     return dets
 
 
@@ -215,42 +384,64 @@ def track(ep_dir, dets, cam):
     return rows, status, ts, imu
 
 
-def render(ep_dir, dets, rows, status, ts, cam, progress):
-    c = av.open(os.path.join(ep_dir, 'scene', 'scene.mkv'))
-    ist = c.streams.video[0]
-    ist.thread_count = 4
-    w, h = int(ist.width), int(ist.height)
+def annotate(img, det, row, status, label, cam):
+    """The tracking overlay plus the status banner, drawn in place."""
+    img = V.draw_frame(img, det, row, cam)
+    h, w = img.shape[:2]
+    text, colour = BANNER[int(status)]
+    cv2.rectangle(img, (0, h - 92), (w, h), (18, 18, 18), -1)
+    cv2.rectangle(img, (0, h - 92), (14, h), colour, -1)
+    for txt, y, sc, col in ((text, h - 54, 1.0, colour), (label, h - 20, 0.62, GREY)):
+        cv2.putText(img, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, sc,
+                    (0, 0, 0), 4 if sc > 0.8 else 3, cv2.LINE_AA)
+        cv2.putText(img, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col,
+                    2 if sc > 0.8 else 1, cv2.LINE_AA)
+    return img
+
+
+def render(ep_dir, dets, rows, status, ts, cam, progress, workers=None):
+    """-> the codec scene_annotated.mp4 was encoded with."""
+    src = os.path.join(ep_dir, 'scene', 'scene.mkv')
+    with av.open(src) as c:
+        w, h = int(c.streams.video[0].width), int(c.streams.video[0].height)
     ow = PREVIEW_WIDTH
     oh = int(round(h * ow / w / 2)) * 2
-    out = Mp4(TL.ep_path(ep_dir, 'scene_annotated.mp4'), ow, oh)
     n = len(rows)
-    try:
-        for i, frame in enumerate(c.decode(ist)):
-            if i >= n:
-                break
-            img = V.draw_frame(frame.to_ndarray(format='bgr24'), dets[i], rows[i], cam)
-            text, colour = BANNER[int(status[i])]
-            cv2.rectangle(img, (0, h - 92), (w, h), (18, 18, 18), -1)
-            cv2.rectangle(img, (0, h - 92), (14, h), colour, -1)
-            for txt, y, sc, col in (
-                    (text, h - 54, 1.0, colour),
-                    (f'frame {i}/{n}   t={(ts[i] - ts[0]) / 1e9:6.3f}s', h - 20, 0.62, GREY)):
-                cv2.putText(img, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, sc,
-                            (0, 0, 0), 4 if sc > 0.8 else 3, cv2.LINE_AA)
-                cv2.putText(img, txt, (30, y), cv2.FONT_HERSHEY_SIMPLEX, sc, col,
-                            2 if sc > 0.8 else 1, cv2.LINE_AA)
-            out.put(cv2.resize(img, (ow, oh), interpolation=cv2.INTER_AREA),
-                    (ts[i] - ts[0]) / 1e6)
-            if (i + 1) % 50 == 0:
-                progress('render', i + 1, n)
-        out.close()
-    finally:
-        c.close()
+
+    def label(i):
+        return f'frame {i}/{n}   t={(ts[i] - ts[0]) / 1e9:6.3f}s'
+
+    if workers is not None:
+        jobs = ((p, dets[i], rows[i], status[i], label(i), (ow, oh))
+                for i, p in zip(range(n), _packets(src)))
+        frames = workers.map(_render_job, jobs)
+    else:
+        def serial():
+            c = av.open(src)
+            st = c.streams.video[0]
+            st.thread_count = 4
+            try:
+                for i, f in zip(range(n), c.decode(st)):
+                    img = annotate(f.to_ndarray(format='bgr24'), dets[i], rows[i], status[i],
+                                   label(i), cam)
+                    yield cv2.resize(img, (ow, oh), interpolation=cv2.INTER_AREA)
+            finally:
+                c.close()
+        frames = serial()
+    out = Mp4(TL.ep_path(ep_dir, 'scene_annotated.mp4'), ow, oh)
+    for i, img in enumerate(frames):
+        out.put(img, (ts[i] - ts[0]) / 1e6)
+        if (i + 1) % 50 == 0:
+            progress('render', i + 1, n)
+    out.close()
+    return out.codec
 
 
 # ------------------------------------------------------------------- prepare
-def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=True):
-    """Build (or reuse) <ep>/derived/. -> the prep.json dict."""
+def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=True,
+            workers=None):
+    """Build (or reuse) <ep>/derived/. -> the prep.json dict.
+    workers: processes for detection and the render; None sizes it to the machine."""
     progress = progress or (lambda *a: None)
     key = cache_key(intr_path)
     if not force and is_prepped(ep_dir, key, videos):
@@ -258,26 +449,44 @@ def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=Tru
     # the track is already valid and only the videos are missing: keep the marker
     track_ok = not force and is_prepped(ep_dir, key, videos=False)
 
+    lower_priority()
+    workers = default_workers() if workers is None else max(1, workers)
     t_start = time.time()
     os.makedirs(TL.ep_path(ep_dir), exist_ok=True)
     marker = TL.ep_path(ep_dir, 'prep.json')
     if not track_ok and os.path.exists(marker):   # never leave a stale marker behind
         os.remove(marker)
 
+    stage, encoder = {}, None
+
+    def lap(name, t0):
+        stage[name] = round(time.time() - t0, 2)
+        return time.time()
+
+    t = time.time()
     if videos and (force or not os.path.exists(TL.ep_path(ep_dir, 'wrist.mp4'))):
-        encode_wrist(ep_dir, progress)
+        encoder = encode_wrist(ep_dir, progress)
+        t = lap('wrist', t)
     dets_npz = TL.ep_path(ep_dir, 'scene_charuco_dets.npz')
     if force and os.path.exists(dets_npz):
         os.remove(dets_npz)
-    dets = detect(ep_dir, progress)
+    dets = load_dets(ep_dir)
 
     with av.open(os.path.join(ep_dir, 'scene', 'scene.mkv')) as c:
         w, h = c.streams.video[0].width, c.streams.video[0].height
     cam = V.load_intrinsics(intr_path, w, h)
-    progress('track', 0, 1)
-    rows, status, ts, imu = track(ep_dir, dets, cam)   # cheap once detections are cached
-    if videos:
-        render(ep_dir, dets, rows, status, ts, cam, progress)
+    # a pool only when there is frame work for it: starting one costs ~1 s
+    pool = Workers(workers, cam) if workers > 1 and (dets is None or videos) else None
+    with pool or contextlib.nullcontext():
+        if dets is None:
+            dets = detect(ep_dir, progress, pool)
+            t = lap('detect', t)
+        progress('track', 0, 1)
+        rows, status, ts, imu = track(ep_dir, dets, cam)   # cheap once detections are cached
+        t = lap('track', t)
+        if videos:
+            encoder = render(ep_dir, dets, rows, status, ts, cam, progress, pool)
+            t = lap('render', t)
 
     wts = _ts(ep_dir, 'wrist')
     plan = TL.plan_episode(ep_dir, with_poses=False)
@@ -287,6 +496,9 @@ def prepare(ep_dir, intr_path=CALIB_JSON, progress=None, force=False, videos=Tru
         'videos': videos,
         'prepared_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'seconds': round(time.time() - t_start, 1),
+        'workers': workers if pool is not None else 1,
+        'encoder': encoder,
+        'stage_s': stage,
         'scene_frames': int(len(ts)),
         'duration_s': float((ts[-1] - ts[0]) / 1e9),
         'wrist_offset_s': float((wts[0] - ts[0]) / 1e9),
@@ -355,6 +567,9 @@ def main():
     ap.add_argument('--calibrate-imu', action='store_true',
                     help='print IMU_ROTATION / IMU_TIME_OFFSET for timeline.py from '
                          'these episodes, and prep nothing')
+    ap.add_argument('--workers', type=int, default=None,
+                    help='processes for detection and the render (default: sized to '
+                         'this machine, 1 = serial)')
     args = ap.parse_args()
     av.logging.set_level(av.logging.PANIC)   # MJPEG APP-marker and pix-fmt noise
     cv2.setNumThreads(4)
@@ -365,15 +580,16 @@ def main():
         def progress(stage, i, n):
             print(f'PROGRESS {stage} {i} {n}', flush=True)
         m = prepare(os.path.abspath(ep), args.intrinsics, progress, args.force,
-                    not args.no_videos)
-        print(f'{ep}: {summary(m)}  ({m["seconds"]} s)', flush=True)
+                    not args.no_videos, args.workers)
+        print(f'{ep}: {summary(m)}  ({m["seconds"]} s, {m.get("workers", 1)} worker(s), '
+              f'{m.get("encoder") or "no video"})', flush=True)
 
 
-def prepare_tracks(ep_dir, intr_path=CALIB_JSON):
+def prepare_tracks(ep_dir, intr_path=CALIB_JSON, workers=None):
     """prepare(videos=False) in a worker process (build_zarr's pool)."""
     av.logging.set_level(av.logging.PANIC)
     cv2.setNumThreads(4)
-    return prepare(ep_dir, intr_path, videos=False)
+    return prepare(ep_dir, intr_path, videos=False, workers=workers)
 
 
 if __name__ == '__main__':

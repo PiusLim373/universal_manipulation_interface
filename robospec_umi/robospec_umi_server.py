@@ -1765,15 +1765,28 @@ class PrepQueue:
                 else:
                     break
 
+    def _workers(self, k):
+        """Worker processes for a new prep, out of the cores left after a reserve.
+        The viewed episode takes what is free; a background one at most a third of
+        the budget, so an episode clicked while two run in the background still
+        gets real workers rather than one."""
+        budget = max(1, EP.usable_cores() - EP.RESERVE_CORES)
+        free = budget - sum(j.get('workers', 0) for j in self.jobs.values()
+                            if j['status'] == 'running')
+        return EP.prep_workers(free if k == self.focus
+                               else min(free, budget // (PREP_WORKERS + 1)))
+
     def _spawn(self, k):
         self.need.pop(k, None)
+        workers = self._workers(k)
         cmd = [sys.executable, '-u', self.SCRIPT, os.path.join(CAPTURE_ROOT, k),
-               '--intrinsics', ACTIVE_JSON]
+               '--intrinsics', ACTIVE_JSON, '--workers', str(workers)]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, cwd=REPO)
         job = self.jobs[k] = {'status': 'running', 'stage': 'start', 'i': 0, 'n': 1,
-                              'proc': proc, 'tail': [], 'started': time.time()}
-        log_edit.info('prep %s started', k)
+                              'proc': proc, 'tail': [], 'started': time.time(),
+                              'workers': workers}
+        log_edit.info('prep %s started (%d worker%s)', k, workers, '' if workers == 1 else 's')
         threading.Thread(target=self._drain, args=(k, job), daemon=True).start()
 
     def _drain(self, k, job):
