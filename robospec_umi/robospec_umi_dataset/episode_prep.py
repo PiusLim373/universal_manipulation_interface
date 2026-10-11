@@ -5,8 +5,8 @@
   scene_charuco_dets.npz  ChArUco detections (independent of the intrinsics)
   scene_tcp.npz           TCP pose + status per scene frame
   scene_annotated.mp4     tracking overlay, on the real capture timestamps
-  prep.json               written last; the cache is valid while version, board
-                          and intrinsics all match
+  prep.json               written last; the cache is valid while the board and
+                          intrinsics match
 
 videos=False builds only what export needs (detections + pose track); the two
 mp4s are added later, cheaply, if the episode is opened in the trimmer.
@@ -37,7 +37,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))   # .../robospec_umi_dataset
 REPO = os.path.dirname(os.path.dirname(HERE))
 CALIB_JSON = os.path.join(REPO, 'data', 'calibration', 'scene_intrinsics.json')
 
-PREP_VERSION = 1
 PREVIEW_WIDTH = 1280
 GOP = 30    # keyframe interval, so a browser seek does not decode from the start
 CRF = 23
@@ -59,8 +58,7 @@ def sha1(path):
 
 
 def cache_key(intr_path=CALIB_JSON):
-    return {'version': PREP_VERSION, 'board': TL.board_key(),
-            'intrinsics_sha1': sha1(intr_path)}
+    return {'board': TL.board_key(), 'intrinsics_sha1': sha1(intr_path)}
 
 
 def read_prep(ep_dir):

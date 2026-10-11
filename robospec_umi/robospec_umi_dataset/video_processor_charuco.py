@@ -457,7 +457,11 @@ INC_S = 0.25            # s; rotation increments the bias fit and calibration co
 FUSED_MAX_RMS = 1.5     # px; with the rotation held, good frames fit < 0.6
 GYRO_MAX_GAP = 0.05     # s; a longer gyro hole (or uncovered scene edge) disables fusion
 MIN_INCREMENTS = 20
-MAX_RESIDUAL = 0.8      # deg; measured 0.35-0.49 when the rig constants are right
+# increment residual / its own vision noise; 0.66-0.87 with good constants at
+# 0.34-0.59 m. Relative, so a far board's noisier vision does not trip it.
+# Scales with SIGMA_PX.
+MAX_RESIDUAL_NORM = 1.2
+MAX_RIG_DEG = 3.5       # per-episode IMU->board fit vs the constant; <=2.1 good, >=4.1 at 5 deg off
 
 
 def so3_exp(rv):
@@ -530,12 +534,27 @@ def increments(t, R, ok):
     return np.nonzero(ok[:-span] & ok[span:])[0], span
 
 
-def fit_gyro_bias(t, R, ok, tg, w, R_bi, iters=4):
-    """Gyro bias with the rig rotation and offset held -> (bias, residual deg, n).
-    Medians throughout, so a vision spike needs no separate mask."""
+def fit_rig(pb, pi):
+    """Board <- IMU rotation from paired increments (vision pb, gyro pi), refit
+    without the worst -> (R_bi, residuals, keep)."""
+    keep = np.ones(len(pb), bool)
+    for _ in range(2):
+        R_bi = kabsch(pb[keep], pi[keep])
+        res = np.linalg.norm(pb - pi @ R_bi.T, axis=1)
+        keep = res < 3 * np.median(res)
+    return R_bi, res, keep
+
+
+def fit_gyro_bias(t, R, sig, ok, tg, w, R_bi, iters=4):
+    """Gyro bias with the rig rotation and offset held -> (bias, stats).
+
+    stats: n increments; residual_deg; residual_norm, the residual over the two
+    frames' vision noise; rig_deg, this episode's own rig fit vs R_bi. Medians
+    throughout, so a vision spike needs no separate mask.
+    """
     i, span = increments(t, R, ok)
     if len(i) < MIN_INCREMENTS:
-        return np.zeros(3), np.inf, len(i)
+        return np.zeros(3), {'n': len(i)}
     pb = so3_log(T_inv(R[i]) @ R[i + span])
     dts = (t[i + span] - t[i])[:, None]
     b = np.zeros(3)
@@ -546,7 +565,10 @@ def fit_gyro_bias(t, R, ok, tg, w, R_bi, iters=4):
     G = integrate_gyro(tg, w - b, t)
     pi = so3_log(T_inv(G[i]) @ G[i + span])
     res = np.linalg.norm(pb - pi @ R_bi.T, axis=1)
-    return b, float(np.degrees(np.median(res))), len(i)
+    rig = so3_log(R_bi.T @ fit_rig(pb, pi)[0])[0]
+    return b, {'n': len(i), 'residual_deg': float(np.degrees(np.median(res))),
+               'residual_norm': float(np.median(res / np.hypot(sig[i], sig[i + span]))),
+               'rig_deg': float(np.degrees(np.linalg.norm(rig)))}
 
 
 def robust_smooth(t, e, w0, sig, window, iters=4):
@@ -632,13 +654,15 @@ def fuse_gyro(dets, rows, gyro, cam, chess, markers, T_centre, T_centre_tcp):
         return vision_only(f'gyro gap of {np.diff(tg).max() * 1000:.0f} ms')
     R, sig = vision_rotations(dets, rows, chess, markers, cam, T_centre)
     have = np.isfinite(sig)
-    b, resid, n_inc = fit_gyro_bias(t, R, have, tg, w, R_bi)
-    if n_inc < MIN_INCREMENTS:
-        return vision_only(f'too few tracked frames to fit the gyro ({n_inc} increments)')
-    if resid > MAX_RESIDUAL:
-        return vision_only(f'gyro and vision disagree ({resid:.2f} deg per {INC_S} s); '
-                           'the IMU rig constants may be stale -- re-run '
-                           'episode_prep.py --calibrate-imu')
+    b, st = fit_gyro_bias(t, R, sig, have, tg, w, R_bi)
+    if st['n'] < MIN_INCREMENTS:
+        return vision_only(f'too few tracked frames to fit the gyro ({st["n"]} increments)')
+    if st['rig_deg'] > MAX_RIG_DEG:
+        return vision_only(f'IMU rig rotation is {st["rig_deg"]:.1f} deg off IMU_ROTATION '
+                           '-- re-run episode_prep.py --calibrate-imu')
+    if st['residual_norm'] > MAX_RESIDUAL_NORM:
+        return vision_only(f'gyro and vision disagree {st["residual_norm"]:.2f}x beyond '
+                           'vision noise (clock offset or a loose mount?)')
 
     H = integrate_gyro(tg, w - b, t) @ R_bi.T     # board orientation up to A
     E = R[have] @ T_inv(H[have])
@@ -667,7 +691,9 @@ def fuse_gyro(dets, rows, gyro, cam, chess, markers, T_centre, T_centre_tcp):
         out.append((Tc, Tc @ T_centre_tcp, r[2], ids,
                     'imu, vision rejected' if rejected else 'imu', r[1]))
     return out, {'fused': True, 'bias_dps': np.degrees(b).round(3).tolist(),
-                 'residual_deg': round(resid, 3), 'vision_rejected': int(n_vis),
+                 'residual_deg': round(st['residual_deg'], 3),
+                 'residual_norm': round(st['residual_norm'], 3),
+                 'rig_deg': round(st['rig_deg'], 2), 'vision_rejected': int(n_vis),
                  'pose_rejected': int(n_pose), 'window_s': FUSION_WINDOW}
 
 
@@ -707,11 +733,7 @@ def calibrate_gyro(eps):
             pi.append(so3_log(T_inv(G[i]) @ G[i + span]))
             dts.append(v['t'][i + span] - v['t'][i])
         pb, pi, dts = map(np.concatenate, (pb, pi, dts))
-        keep = np.ones(len(pb), bool)
-        for _ in range(2):
-            R_bi = kabsch(pb[keep], pi[keep])
-            res = np.linalg.norm(pb - pi @ R_bi.T, axis=1)
-            keep = res < 3 * np.median(res)
+        R_bi, res, keep = fit_rig(pb, pi)
         b += np.median((pi - pb @ R_bi)[keep] / dts[keep, None], axis=0)
     return off, R_bi, b, {'speed_corr': float(corr.max() / len(eps)),
                           'increments': f'{int(keep.sum())}/{len(keep)}',

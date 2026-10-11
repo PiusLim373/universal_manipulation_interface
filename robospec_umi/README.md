@@ -443,9 +443,12 @@ bias is fitted per episode. After remounting the D455 or the board, re-measure t
 python robospec_umi/robospec_umi_dataset/episode_prep.py --calibrate-imu data/capture/<datetime>/ep*
 ```
 
-If an episode's gyro and vision disagree by more than 0.8° per 0.25 s (stale
-constants), or the gyro has a gap over 50 ms, that episode stays vision only and
-`prep.json` says why. The Edit list tags episodes `imu` or `vision only`, and the
+Each episode is checked before fusing. It stays vision only, and `prep.json` says
+why, if its own fit of the IMU→board rotation is more than 3.5° off `IMU_ROTATION`
+(stale constants), if gyro and vision disagree by more than 1.2× what vision's own
+noise explains (clock offset, loose mount), or if the gyro has a gap over 50 ms.
+The disagreement check is relative, so a board far from the scene camera, whose
+vision is noisier, still fuses. The Edit list tags episodes `imu` or `vision only`, and the
 export report lists which ones were fused.
 
 ---
