@@ -18,7 +18,7 @@ robospec_umi/
 ├── robospec_umi_franka/        eval with robot (design notes)
 ├── robospec_umi_ui/            web UI (React + Vite)
 ├── robospec_umi_server.py      UI server, the container's entrypoint
-└── docs/                       ChArUco boards to print, screenshots
+└── docs/                       ChArUco boards to print, sample calibration, screenshots
 
 data/                           at the repo root
 ├── calibration/                scene_intrinsics.json is the active calibration
@@ -114,6 +114,12 @@ flowchart LR
 5. **Validate:** **Test this calibration**. Walk the board into the corners;
    the error by radius should stay low, and the distance shown (camera to the
    board's origin corner) should match a tape measure.
+
+**Using the same camera?** You can skip steps 2–4: click **Upload intrinsic .json**
+and pick [`docs/sample_scene_intrinsics.json`](docs/sample_scene_intrinsics.json)
+(DECXIN at 1920×1080, focus 0, zoom 100). It becomes the active calibration if
+there isn't one. Every lens differs a little, so still run **Validate**, and
+calibrate your own if the distance is off.
 
 ![Calibration](docs/calibration.png)
 

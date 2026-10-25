@@ -1,0 +1,77 @@
+{
+    "intrinsic_type": "PINHOLE",
+    "distortion_model": "rational",
+    "source_run": "20261003_235039",
+    "solved_at": "2026-10-03T23:56:03",
+    "k": [
+        668.5841726481713,
+        0.0,
+        972.1161881230992,
+        0.0,
+        667.9898378528463,
+        544.3452583026605,
+        0.0,
+        0.0,
+        1.0
+    ],
+    "d": [
+        0.06167306430441986,
+        0.14735942590924772,
+        0.00037617581830547803,
+        -0.0006692793774740894,
+        -0.08280588147061964,
+        0.007154739286411724,
+        0.22062600142317607,
+        -0.09979188145533739
+    ],
+    "image_width": 1920,
+    "image_height": 1080,
+    "fps": 120.0,
+    "final_reproj_error": 0.48469832715793654,
+    "holdout_reproj_error": 0.45116379464927475,
+    "nr_calib_images": 74,
+    "std_dev": {
+        "fx": 1.3208135054409014,
+        "fy": 1.3361958530464233,
+        "cx": 0.900681497852648,
+        "cy": 1.1136700927782979
+    },
+    "straightness_px": {
+        "raw_mean": 0.4647215576098378,
+        "undistorted_mean": 0.2419320678267108
+    },
+    "fov_deg": {
+        "horizontal": 110.2900644977118,
+        "vertical": 77.9038389595451
+    },
+    "locked_controls": {
+        "white_balance_automatic": 1,
+        "white_balance_temperature": 4600,
+        "backlight_compensation": 16,
+        "gamma": 128,
+        "gain": 66,
+        "focus_automatic_continuous": 0,
+        "focus_absolute": 0,
+        "zoom_absolute": 100,
+        "auto_exposure": 1,
+        "exposure_time_absolute": 446
+    },
+    "board": {
+        "dict": "DICT_4X4_50",
+        "squares": [
+            7,
+            5
+        ],
+        "square_len_m": 0.03,
+        "marker_len_m": 0.022
+    },
+    "intrinsics": {
+        "aspect_ratio": 0.9991110546440685,
+        "focal_length": 668.5841726481713,
+        "focal_length_y": 667.9898378528463,
+        "principal_pt_x": 972.1161881230992,
+        "principal_pt_y": 544.3452583026605,
+        "skew": 0.0
+    },
+    "stabelized": false
+}
