@@ -12,6 +12,8 @@
 # node stage when there is something to compile.
 
 FROM mambaorg/micromamba:1.5-jammy
+# links the ghcr.io package to this repo
+LABEL org.opencontainers.image.source=https://github.com/PiusLim373/universal_manipulation_interface
 USER root
 
 # The base image's entrypoint activates an env before running the command. Not

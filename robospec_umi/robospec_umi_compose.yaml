@@ -23,7 +23,7 @@ services:
         # only the image's default account; `user:` below is what runs.
         UID: "${ROBOSPEC_UID:-1000}"
         GID: "${ROBOSPEC_GID:-1000}"
-    image: robospec-umi:oct_2026
+    image: ghcr.io/piuslim373/robospec-umi:oct_2026
     container_name: robospec_umi
 
     # Run as the host user, chosen when the container starts rather than when the
