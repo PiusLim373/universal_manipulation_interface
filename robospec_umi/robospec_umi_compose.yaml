@@ -62,6 +62,8 @@ services:
       DISPLAY: ${DISPLAY:-:0}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
       NVIDIA_VISIBLE_DEVICES: all
+      # the repo's host path, for the Training page's "This machine" command
+      ROBOSPEC_UMI_DIRECTORY: ${ROBOSPEC_UMI_DIRECTORY}
 
     ports:
       - "8080:8080"

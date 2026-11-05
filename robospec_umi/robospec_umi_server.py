@@ -2337,7 +2337,9 @@ async def train_info(request):
     cfg = _read_yaml(TRAIN_CONFIG) or {}
     tr = cfg.get('training') or {}
     return web.json_response({
-        'in_container': os.path.exists('/.dockerenv'), 'container': CONTAINER, 'repo': REPO,
+        'in_container': os.path.exists('/.dockerenv'), 'container': CONTAINER,
+        # host path: REPO is /workspace in the container
+        'repo': os.environ.get('ROBOSPEC_UMI_DIRECTORY', REPO),
         'config': os.path.splitext(os.path.basename(TRAIN_CONFIG))[0],
         'defaults': {'num_epochs': tr.get('num_epochs'), 'checkpoint_every': tr.get('checkpoint_every'),
                      'lr': (cfg.get('optimizer') or {}).get('lr')},
